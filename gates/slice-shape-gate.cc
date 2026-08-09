@@ -21,10 +21,11 @@
 #include <map>
 
 using namespace ns3;
+using namespace std;
 
 static void
 AddFlow(Ptr<Node> src, Ptr<Node> dst, Ipv4Address dstAddr, uint16_t port,
-        const std::string& rate, uint8_t tos, uint32_t pktSize, double start, double stop)
+        const string& rate, uint8_t tos, uint32_t pktSize, double start, double stop)
 {
     OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(dstAddr, port));
     onoff.SetConstantRate(DataRate(rate), pktSize);
@@ -43,13 +44,13 @@ int
 main(int argc, char* argv[])
 {
     bool shape = false;
-    std::string embbRate = "60Mb/s"; // eMBB demand (overloaded)
-    std::string urllcRate = "4Mb/s";
-    std::string mmtcRate = "2Mb/s";
+    string embbRate = "60Mb/s"; // eMBB demand (overloaded)
+    string urllcRate = "4Mb/s";
+    string mmtcRate = "2Mb/s";
     // Allocated shares (sum 18 < link capacity ~50): eMBB capped hard, URLLC/mMTC roomy.
-    std::string embbShare = "8Mb/s";
-    std::string urllcShare = "6Mb/s";
-    std::string mmtcShare = "4Mb/s";
+    string embbShare = "8Mb/s";
+    string urllcShare = "6Mb/s";
+    string mmtcShare = "4Mb/s";
     uint32_t pktSize = 700;
     CommandLine cmd;
     cmd.AddValue("shape", "Enforce per-slice allocated shares with a classful token-bucket", shape);
@@ -98,7 +99,7 @@ main(int argc, char* argv[])
     // the mesh-slicing pipeline shapes the OnOff source the same way.)
     // Only eMBB exceeds its share (60 > 8) so only it gets cut; URLLC (4<6) and mMTC
     // (2<4) are under their shares and pass at their demand either way.
-    std::string embbOnWire = shape ? embbShare : embbRate;
+    string embbOnWire = shape ? embbShare : embbRate;
 
     Ipv4Address d = iface.GetAddress(1);
     AddFlow(nodes.Get(0), nodes.Get(1), d, 5001, embbOnWire, 0x18, pktSize, 1.0, 6.0); // eMBB (greedy)
@@ -111,13 +112,13 @@ main(int argc, char* argv[])
     Simulator::Stop(Seconds(7.0));
     Simulator::Run();
 
-    std::map<uint16_t, const char*> name = {{5001, "eMBB "}, {5002, "URLLC"}, {5003, "mMTC "}};
-    std::map<uint16_t, std::string> demand = {{5001, embbRate}, {5002, urllcRate}, {5003, mmtcRate}};
+    map<uint16_t, const char*> name = {{5001, "eMBB "}, {5002, "URLLC"}, {5003, "mMTC "}};
+    map<uint16_t, string> demand = {{5001, embbRate}, {5002, urllcRate}, {5003, mmtcRate}};
     Ptr<Ipv4FlowClassifier> cl = DynamicCast<Ipv4FlowClassifier>(fmh.GetClassifier());
-    std::cout << std::fixed << std::setprecision(3);
-    std::cout << "\n=== slice-shape gate  (enforcement " << (shape ? "ON" : "OFF")
+    cout << fixed << setprecision(3);
+    cout << "\n=== slice-shape gate  (enforcement " << (shape ? "ON" : "OFF")
               << ", eMBB demand " << embbRate << (shape ? ", share " + embbShare : "") << ") ===\n";
-    std::cout << "slice   demand   thpt(Mb/s)   delay(ms)   loss(%)\n";
+    cout << "slice   demand   thpt(Mb/s)   delay(ms)   loss(%)\n";
     for (const auto& [id, st] : fm->GetFlowStats())
     {
         Ipv4FlowClassifier::FiveTuple ft = cl->FindFlow(id);
@@ -130,8 +131,8 @@ main(int argc, char* argv[])
         double thpt = (dur > 0) ? st.rxBytes * 8.0 / dur / 1e6 : 0.0;
         double delay = (st.rxPackets > 0) ? st.delaySum.GetSeconds() / st.rxPackets * 1e3 : 0.0;
         double loss = (st.txPackets > 0) ? 100.0 * (st.txPackets - st.rxPackets) / st.txPackets : 0.0;
-        std::cout << it->second << "  " << std::setw(7) << demand[ft.destinationPort] << "  "
-                  << std::setw(8) << thpt << "   " << std::setw(9) << delay << "   " << std::setw(7)
+        cout << it->second << "  " << setw(7) << demand[ft.destinationPort] << "  "
+                  << setw(8) << thpt << "   " << setw(9) << delay << "   " << setw(7)
                   << loss << "\n";
     }
 

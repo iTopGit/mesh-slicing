@@ -13,6 +13,7 @@
 #include "ns3/wifi-module.h"
 
 using namespace ns3;
+using namespace std;
 
 int
 main(int argc, char* argv[])
@@ -35,7 +36,7 @@ main(int argc, char* argv[])
     channel.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(maxRange));
     YansWifiPhyHelper phy;
     phy.SetChannel(channel.Create());
-    std::ostringstream ch;
+    ostringstream ch;
     ch << "{0, " << chWidth << ", BAND_5GHZ, 0}";
     phy.Set("ChannelSettings", StringValue(ch.str()));
 
@@ -88,7 +89,7 @@ main(int argc, char* argv[])
     // the MAC's EDCA. If VO delivers more than BK, EDCA works on ax ad-hoc.
     struct Flow { const char* name; uint8_t tos; uint16_t port; };
     Flow flows[] = {{"URLLC(VO)", 0x10, 5001}, {"eMBB(VI)", 0x18, 5002}, {"mMTC(BK)", 0x08, 5003}};
-    std::vector<Ptr<PacketSink>> sinks;
+    vector<Ptr<PacketSink>> sinks;
     for (const Flow& f : flows)
     {
         OnOffHelper onoff("ns3::UdpSocketFactory",
@@ -110,12 +111,12 @@ main(int argc, char* argv[])
     Simulator::Stop(Seconds(6.0));
     Simulator::Run();
 
-    std::cout << "ax ad-hoc " << chWidth << "MHz, " << (nNodes - 1)
-              << " hops, 3x100Mb/s prioritized flows:" << std::endl;
+    cout << "ax ad-hoc " << chWidth << "MHz, " << (nNodes - 1)
+              << " hops, 3x100Mb/s prioritized flows:" << endl;
     for (size_t i = 0; i < 3; ++i)
     {
         double mb = sinks[i]->GetTotalRx() * 8.0 / 4.0 / 1e6;
-        std::cout << "  " << flows[i].name << ": " << mb << " Mb/s delivered" << std::endl;
+        cout << "  " << flows[i].name << ": " << mb << " Mb/s delivered" << endl;
     }
 
     Simulator::Destroy();
