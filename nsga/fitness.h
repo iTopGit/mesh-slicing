@@ -44,7 +44,7 @@ std::vector<double> FairShare(double R, const std::vector<double>& demand);
 // contention per shared link, and write the 3 objectives into ind.obj:
 //   obj[0] eMBB  = min fair-share throughput across its tree (bottleneck, maximize)
 //   obj[1] URLLC = worst member's summed path delay C/(1-U) (minimize)
-//   obj[2] mMTC  = tree link count (scale/cost proxy, TBD, minimize)
+//   obj[2] mMTC  = tree link count (scale/cost, minimize)
 void Evaluate(Individual& ind,
               const Graph& g,
               const std::array<SliceSpec, NUM_SLICES>& slices,

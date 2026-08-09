@@ -191,7 +191,8 @@ Evaluate(Individual& ind,
     }
     ind.obj[1] = urllcMax;
 
-    // obj[2] mMTC: tree link count (scale/cost proxy — PopJoi.md TBD).
+    // obj[2] mMTC: tree link count (scale/cost — mMTC is low-rate + delay-insensitive,
+    // its concern is connecting many nodes cheaply; see PLAN.md §3).
     ind.obj[2] = static_cast<double>(trees[2].links.size());
 }
 
