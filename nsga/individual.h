@@ -19,6 +19,16 @@ struct Individual
 {
     std::array<std::vector<uint32_t>, NUM_SLICES> seg; // connect-order per slice
     std::array<double, NUM_SLICES> obj = {0.0, 0.0, 0.0};
+
+    // Members left with no path to their slice's root, summed over the three slices. This is
+    // the constraint violation: 0 is feasible, and Dominates() ranks any feasible individual
+    // above any infeasible one (Deb's constraint-domination). Without it two of the three
+    // objectives REWARD disconnection -- URLLC's delay is the worst member's path delay, which
+    // a stranded member contributes nothing to, and mMTC's is its tree's link count, which an
+    // empty tree minimises perfectly. "Connect nobody" then scores 0 on both, i.e. the ideal
+    // point, which is exactly where KneePoint looks.
+    int stranded = 0;
+
     int rank = 0;
     double crowd = 0.0;
 };

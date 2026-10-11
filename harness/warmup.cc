@@ -4,7 +4,12 @@
 #include "ns3/mobility-model.h"
 #include "ns3/on-off-helper.h"
 #include "ns3/packet-sink-helper.h"
+#include "ns3/queue-disc.h"
 #include "ns3/simulator.h"
+#include "ns3/traffic-control-layer.h"
+#include "ns3/wifi-mac-queue.h"
+#include "ns3/wifi-mac.h"
+#include "ns3/wifi-net-device.h"
 
 #include <algorithm>
 #include <fstream>
@@ -14,6 +19,96 @@
 using namespace ns3;
 using namespace std;
 
+static uint32_t
+CountQueueDisc(Ptr<QueueDisc> d)
+{
+    uint32_t n = d->GetNPackets();
+    for (uint32_t i = 0; i < d->GetNQueueDiscClasses(); ++i)
+    {
+        n += CountQueueDisc(d->GetQueueDiscClass(i)->GetQueueDisc());
+    }
+    return n;
+}
+
+// Everything one node still holds for transmission: the queue disc tree plus the radio's own
+// AC_BE queue. Zero means the probe it just sent has fully left, which is the condition the
+// next edge waits on -- a measured state, not a guessed interval.
+static uint32_t
+PendingPackets(const MeshTopology& mesh, uint32_t node)
+{
+    uint32_t n = 0;
+    Ptr<NetDevice> dev = mesh.devices.Get(node);
+    Ptr<TrafficControlLayer> tc = mesh.nodes.Get(node)->GetObject<TrafficControlLayer>();
+    if (tc)
+    {
+        Ptr<QueueDisc> root = tc->GetRootQueueDiscOnDevice(dev);
+        if (root)
+        {
+            n += CountQueueDisc(root);
+        }
+    }
+    Ptr<WifiNetDevice> wifi = DynamicCast<WifiNetDevice>(dev);
+    if (wifi && wifi->GetMac())
+    {
+        Ptr<WifiMacQueue> q = wifi->GetMac()->GetTxopQueue(AC_BE);
+        if (q)
+        {
+            n += q->GetNPackets();
+        }
+    }
+    return n;
+}
+
+// Drop everything the sender still holds, so the next link starts from a known state. RFC 2544
+// asks for the device under test to be returned to a known state between trials; on a bench that
+// is a reset, not a wait. Without it the leftovers of a saturating probe are packets whose
+// lifetime has already expired -- never deliverable, and only reaped lazily.
+static void
+FlushSender(const MeshTopology& mesh, uint32_t node)
+{
+    Ptr<NetDevice> dev = mesh.devices.Get(node);
+    Ptr<TrafficControlLayer> tc = mesh.nodes.Get(node)->GetObject<TrafficControlLayer>();
+    if (tc)
+    {
+        Ptr<QueueDisc> root = tc->GetRootQueueDiscOnDevice(dev);
+        // Dequeue rather than flushing the internal queues, so the disc's own counters follow.
+        while (root && root->Dequeue())
+        {
+        }
+    }
+    Ptr<WifiNetDevice> wifi = DynamicCast<WifiNetDevice>(dev);
+    if (wifi && wifi->GetMac())
+    {
+        Ptr<WifiMacQueue> q = wifi->GetMac()->GetTxopQueue(AC_BE);
+        if (q)
+        {
+            q->Flush();
+        }
+    }
+}
+
+// Read the R sink's byte counter at a fixed instant. Two of these bracket the measured
+// interval, so what lands in the link table is bytes-per-second over an interval we chose,
+// not over however long the arrivals happened to straggle.
+static void
+SnapRWindowStart(WarmupContext* ctx, size_t edgeIdx)
+{
+    if (ctx->rwin[edgeIdx].sink)
+    {
+        ctx->rwin[edgeIdx].startRx = ctx->rwin[edgeIdx].sink->GetTotalRx();
+    }
+}
+
+static void
+SnapRWindowEnd(WarmupContext* ctx, size_t edgeIdx, double dur)
+{
+    if (ctx->rwin[edgeIdx].sink)
+    {
+        ctx->rwin[edgeIdx].endRx = ctx->rwin[edgeIdx].sink->GetTotalRx();
+        ctx->rwin[edgeIdx].dur = dur;
+    }
+}
+
 // Schedule one edge's isolated sweep at sim time `t`: prime (unmeasured, resolves
 // ARP + lets the queue settle so it doesn't corrupt the measurement), then L
 // (empty → base_delay), then R (saturating → capacity). One window each, a -> b,
@@ -21,11 +116,11 @@ using namespace std;
 static double
 ScheduleEdgeWindows(WarmupSession* s, size_t edgeIdx, double t)
 {
-    const uint32_t pktSize = 700;        // match slice payload (proposal)
+
     const string lRate = "1Mb/s";        // low → link stays ~empty → base_delay
     const string rRate = s->satRate;     // above link ceiling → saturates → R
     const double primeSec = s->primeSec; // ARP resolve + queue settle before measuring
-    const double guard = 0.5;            // drain queue + channel between windows
+    const double guard = s->guardSec;    // drain queue + channel between windows
 
     uint32_t a = s->edges[edgeIdx].first;
     uint32_t b = s->edges[edgeIdx].second;
@@ -49,7 +144,7 @@ ScheduleEdgeWindows(WarmupSession* s, size_t edgeIdx, double t)
         uint16_t port = s->nextPort++;
         OnOffHelper onoff("ns3::UdpSocketFactory",
                           InetSocketAddress(s->interfaces.GetAddress(b), port));
-        onoff.SetConstantRate(DataRate(sw.rate), pktSize);
+        onoff.SetConstantRate(DataRate(sw.rate), s->pktSize);
         ApplicationContainer src = onoff.Install(s->mesh.nodes.Get(a));
         src.Start(Seconds(t - now));
         src.Stop(Seconds(t + sw.dur - now));
@@ -58,7 +153,12 @@ ScheduleEdgeWindows(WarmupSession* s, size_t edgeIdx, double t)
                               InetSocketAddress(Ipv4Address::GetAny(), port));
         ApplicationContainer rcv = sink.Install(s->mesh.nodes.Get(b));
         rcv.Start(Seconds(t - now));
-        rcv.Stop(Seconds(t + sw.dur + guard - now));
+        // The R sink is never stopped: the probe's drain is part of what the link delivered, and
+        // a stop time would be another guess at how long that takes.
+        if (sw.phase != 1)
+        {
+            rcv.Stop(Seconds(t + sw.dur + guard - now));
+        }
 
         if (sw.phase == 0)
         {
@@ -69,6 +169,16 @@ ScheduleEdgeWindows(WarmupSession* s, size_t edgeIdx, double t)
         {
             s->ctx.portToProbe[port] = {edgeIdx, sw.phase};
             s->lastSinks[edgeIdx].second = DynamicCast<PacketSink>(rcv.Get(0));
+            s->ctx.rwin[edgeIdx].sink = s->lastSinks[edgeIdx].second;
+            // Skip the head of the window: the first packets meet an empty MAC queue, so
+            // they leave faster than the link's steady rate and would read high.
+            double skip = min(0.1, sw.dur / 5.0);
+            Simulator::Schedule(Seconds(t + skip - now), &SnapRWindowStart, &s->ctx, edgeIdx);
+            Simulator::Schedule(Seconds(t + sw.dur - now),
+                                &SnapRWindowEnd,
+                                &s->ctx,
+                                edgeIdx,
+                                sw.dur - skip);
         }
         t += sw.dur + guard;
     }
@@ -115,32 +225,85 @@ BuildEdgeListGeometric(const MeshTopology& mesh, double maxDist)
     return edges;
 }
 
+static void StartNextEdge(WarmupSession* s);
+
+// Hold the sweep until the sender it just used has nothing left to transmit. This is what makes
+// the measurement honest without any tuned constant: a probe above the link ceiling always
+// leaves a backlog, and that backlog drains at the LINK rate only while nothing else is on air.
+// Start the next edge too early and the drain crawls instead, which is what read a healthy
+// 82.9 Mb/s link as 11.8-35. Nothing here is a guess at how long draining takes; the queues are
+// asked.
+static void
+WaitDrain(WarmupSession* s, uint32_t sender)
+{
+    uint32_t n = PendingPackets(s->mesh, sender);
+    double now = Simulator::Now().GetSeconds();
+    if (n != s->drainLast)
+    {
+        s->drainLast = n;
+        s->drainLastChange = now;
+    }
+    // Empty is the normal exit. A count that has stopped moving is the other one: a queue can
+    // hold a packet that will never be sent (an expired lifetime is only reaped on the next
+    // dequeue), and waiting on it would stall the sweep forever. Either way nothing is on air.
+    if (n > 0 && now - s->drainLastChange < s->drainStallSec)
+    {
+        Simulator::Schedule(Seconds(s->drainPollSec), &WaitDrain, s, sender);
+        return;
+    }
+    if (n > 0 && s->traceR)
+    {
+        cout << "  drain node " << sender << " stalled with " << n << " packet(s) held" << endl;
+    }
+    if (s->flushSender)
+    {
+        FlushSender(s->mesh, sender);
+    }
+    s->drainLast = UINT32_MAX;
+    StartNextEdge(s);
+}
+
+static void
+StartNextEdge(WarmupSession* s)
+{
+    if (s->cursor >= s->pending.size())
+    {
+        Simulator::ScheduleNow(&WarmupRetryPass, s);
+        return;
+    }
+    size_t e = s->pending[s->cursor++];
+    double now = Simulator::Now().GetSeconds();
+    double end = ScheduleEdgeWindows(s, e, now);
+    Simulator::Schedule(Seconds(end - now), &WaitDrain, s, s->edges[e].first);
+}
+
 void
 BeginWarmup(WarmupSession* s)
 {
     s->edges = BuildEdgeListGeometric(s->mesh);
     s->ctx.edges = s->edges;
-    cout << "edge list (" << s->edges.size() << " edges), serial sweep" << endl;
+    s->ctx.traceR = s->traceR;
+    s->ctx.pktSize = s->pktSize;
+    s->ctx.rwin.assign(s->edges.size(), WarmupContext::RWindow{});
+    cout << "edge list (" << s->edges.size() << " edges), serial sweep, drain-gated" << endl;
 
-    // One edge at a time (staggered): a clean, uncontended base is what the
-    // contention model needs. (Spatial-reuse batching was tried and dropped — no
-    // real speedup on the mesh, and on wide-channel ax it corrupts the data.)
-    double start = Simulator::Now().GetSeconds();
-    double t = start;
+    // One edge at a time, and the next one does not start until the last sender's queues are
+    // empty. Edges used to be scheduled back to back at fixed times, which overlapped each
+    // probe's drain with the following measurement. (Spatial-reuse batching was tried and
+    // dropped -- no real speedup on the mesh, and on wide-channel ax it corrupts the data.)
+    s->pending.clear();
     for (size_t e = 0; e < s->edges.size(); ++e)
     {
-        t = ScheduleEdgeWindows(s, e, t);
+        s->pending.push_back(e);
     }
-    s->nextTime = t;
+    s->cursor = 0;
     s->round = 1;
 
-    // Safety stop bounding the worst case (every round retries every edge). The
-    // converging WarmupRetryPass sets an earlier stop, which fires first.
-    double perRound = t - start;
-    Simulator::Stop(Seconds((t - start) + perRound * (s->maxRounds + 1) + 2.0));
-
-    Simulator::Schedule(Seconds(t - start), &WarmupRetryPass, s);
-    cout << "warm-up round 1: " << s->edges.size() << " edges, ends ~" << t << "s" << endl;
+    // Safety bound only: the sweep now ends when the queues say so, and WarmupRetryPass sets the
+    // real stop. 10 s per edge per round is far above anything measured.
+    Simulator::Stop(Seconds(s->edges.size() * 10.0 * (s->maxRounds + 1) + 2.0));
+    StartNextEdge(s);
+    cout << "warm-up round 1: " << s->edges.size() << " edges" << endl;
 }
 
 void
@@ -213,16 +376,11 @@ WarmupRetryPass(WarmupSession* s)
     }
     cout << endl;
 
-    double start = Simulator::Now().GetSeconds();
-    double t = start;
-    // Re-measure just the failed edges, serially, at this later time.
-    for (size_t e : bad)
-    {
-        t = ScheduleEdgeWindows(s, e, t);
-    }
-    s->nextTime = t;
+    // Re-measure just the failed edges, one at a time, drain-gated like the first round.
+    s->pending = bad;
+    s->cursor = 0;
     ++s->round;
-    Simulator::Schedule(Seconds(t - start), &WarmupRetryPass, s);
+    StartNextEdge(s);
 }
 
 vector<LinkMeasurement>
@@ -254,7 +412,29 @@ ExtractLinkTable(const WarmupContext& ctx,
         else
         {
             double dur = (s.timeLastRxPacket - s.timeFirstRxPacket).GetSeconds();
-            table[e].capacityBps = (dur > 0) ? (s.rxBytes * 8.0 / dur) : 0.0;
+            double spanBps = (dur > 0) ? (s.rxBytes * 8.0 / dur) : 0.0;
+            table[e].capacityBps = spanBps;
+            // Cross-check only: bytes over a fixed sub-window. It should agree with the span
+            // figure now that the sender is reset between links, and a disagreement means a
+            // leftover from the previous link got counted.
+            double winBps = 0.0;
+            if (e < ctx.rwin.size() && ctx.rwin[e].dur > 0.0 &&
+                ctx.rwin[e].endRx >= ctx.rwin[e].startRx)
+            {
+                double hdr = (ctx.pktSize + 28.0) / ctx.pktSize; // payload -> IP-layer bytes
+                winBps = (ctx.rwin[e].endRx - ctx.rwin[e].startRx) * hdr * 8.0 / ctx.rwin[e].dur;
+            }
+            // Capacity = bytes/span, so a wrong answer is either too few bytes or too long a
+            // span. Printing both separates them; without it the only visible symptom is a
+            // number that looks plausible. (A 300Mb/s probe used to read ~7x low here.)
+            if (ctx.traceR)
+            {
+                cout << "  R " << table[e].a << "-" << table[e].b << " tx=" << s.txPackets
+                     << " rx=" << s.rxPackets << " loss="
+                     << (s.txPackets ? 100.0 * (s.txPackets - s.rxPackets) / s.txPackets : 0.0)
+                     << "%  span=" << dur << "s  -> " << (table[e].capacityBps / 1e6)
+                     << " Mbps  (window " << (winBps / 1e6) << ")" << endl;
+            }
         }
     }
     return table;

@@ -27,13 +27,20 @@ class Graph
     static Graph FromGrid(uint32_t width, uint32_t height, double baseDelayMs, double capacityMbps);
 
     uint32_t NumNodes() const { return mNum; }
-    bool HasLink(uint32_t a, uint32_t b) const;
     const Link& GetLink(uint32_t a, uint32_t b) const;
 
     // Dijkstra from `src` (base-delay cost) to the nearest node flagged in `inSet`.
     // Returns the path src..target (inclusive); {src} if src is already in the set;
     // empty if none reachable.
     std::vector<uint32_t> NearestInSet(uint32_t src, const std::vector<char>& inSet) const;
+
+    /**
+     * Nodes one hop from `n`, plus `n` itself. Fitness needs this to build a link's interference
+     * set: under CSMA a node defers to anything it can hear, and `harness/topology.cc` sets
+     * `RxSensitivity = -86` precisely so a node hears its axis neighbours (50 m) and not the
+     * diagonals (70.7 m) - so "can hear" and "shares a graph edge" are the same relation here.
+     */
+    bool Hears(uint32_t a, uint32_t b) const;
 
   private:
     static std::pair<uint32_t, uint32_t> Key(uint32_t a, uint32_t b);

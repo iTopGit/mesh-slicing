@@ -4,6 +4,7 @@
 
 #include "graph.h"
 #include "nsga2.h"
+#include "routing.h"
 
 #include "ns3/core-module.h"
 
@@ -62,6 +63,7 @@ main(int argc, char* argv[])
     bool trace = false;
     int showGen = -1;
     bool showPaths = false;
+    bool showRoutes = false;
 
     CommandLine cmd;
     cmd.AddValue("gridWidth", "Grid width (columns)", gridWidth);
@@ -83,6 +85,7 @@ main(int argc, char* argv[])
     cmd.AddValue("trace", "Print per-generation best-objective progress", trace);
     cmd.AddValue("showGen", "Dump one individual at this generation (-1 = never)", showGen);
     cmd.AddValue("showPaths", "Print initial vs final decoded routes", showPaths);
+    cmd.AddValue("showRoutes", "Print the knee solution's next-hop routing table", showRoutes);
     cmd.Parse(argc, argv);
 
     uint32_t rows = (gridHeight == 0) ? gridWidth : gridHeight;
@@ -97,17 +100,23 @@ main(int argc, char* argv[])
                   ? Graph::FromGrid(gridWidth, rows, baseDelayMs, capacityMbps)
                   : Graph::FromLinkTable(linktable, numNodes);
 
-    // Assign disjoint members: shuffle all node ids, then cut the first Me/Mu/Mc off
-    // for eMBB/URLLC/mMTC. This is the fixed problem instance the GA optimizes over.
+    // Assign disjoint members: shuffle all node ids, then cut the first Me/Mu/Mc off for
+    // eMBB/URLLC/mMTC. This is the fixed problem instance the GA optimizes over. Members are
+    // consumed two at a time as source->destination pairs (Slice::Pairs), so the counts are even.
+    if (Me % 2 || Mu % 2 || Mc % 2)
+    {
+        cout << "error: Me/Mu/Mc must be even - members are drawn as src->dst pairs\n";
+        return 1;
+    }
     mt19937 rng(seed);
     vector<uint32_t> pool(numNodes);
     iota(pool.begin(), pool.end(), 0);
     shuffle(pool.begin(), pool.end(), rng);
 
-    array<SliceSpec, NUM_SLICES> slices;
-    slices[0] = {{pool.begin(), pool.begin() + Me}, embb};
-    slices[1] = {{pool.begin() + Me, pool.begin() + Me + Mu}, urllc};
-    slices[2] = {{pool.begin() + Me + Mu, pool.begin() + Me + Mu + Mc}, mmtc};
+    array<Slice, NUM_SLICES> slices;
+    slices[0] = {.name = "eMBB", .members = {pool.begin(), pool.begin() + Me}, .demandMbps = embb};
+    slices[1] = {.name = "URLLC", .members = {pool.begin() + Me, pool.begin() + Me + Mu}, .demandMbps = urllc};
+    slices[2] = {.name = "mMTC", .members = {pool.begin() + Me + Mu, pool.begin() + Me + Mu + Mc}, .demandMbps = mmtc};
 
     cout << "=== NSGA-II joint routing (" << gridWidth << "x" << rows << " mesh, " << numNodes
               << " nodes) ===\n";
@@ -174,6 +183,30 @@ main(int argc, char* argv[])
     if (showPaths)
     {
         PrintPaths("FINAL — knee-point pick", distinct[knee], g);
+    }
+
+    if (showRoutes)
+    {
+        vector<Route> routes = BuildRoutes(g, distinct[knee], slices);
+        sort(routes.begin(), routes.end(), [](const Route& a, const Route& b) {
+            if (a.slice != b.slice)
+            {
+                return a.slice < b.slice;
+            }
+            if (a.node != b.node)
+            {
+                return a.node < b.node;
+            }
+            return a.dest < b.dest;
+        });
+        const char* sn[NUM_SLICES] = {"eMBB ", "URLLC", "mMTC "};
+        cout << "\n=== next-hop routing table (knee solution, " << routes.size() << " entries) ===\n";
+        cout << "slice   node   dest   nextHop\n";
+        for (const Route& r : routes)
+        {
+            cout << sn[r.slice] << "  " << setw(4) << r.node << "  " << setw(5) << r.dest << "  "
+                 << setw(7) << r.nextHop << "\n";
+        }
     }
     return 0;
 }

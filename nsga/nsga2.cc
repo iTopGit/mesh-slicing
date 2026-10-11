@@ -21,9 +21,28 @@ namespace nsga {
 // a "dominates" b when a is no worse on every objective and strictly better on at
 // least one. Objectives have different senses (eMBB maximized, the other two
 // minimized), so minimized ones are negated to read as "bigger is better" too.
-bool
+//
+// CONSTRAINT-DOMINATION (Deb et al., NSGA-II, IEEE TEC 6(2), 2002, §III-C) comes first:
+// an individual that strands members is infeasible however good its objectives look, and
+// two of the three objectives actively reward stranding (see Individual::stranded). The
+// three rules below are Deb's: feasible beats infeasible; between two infeasible ones the
+// smaller violation wins; between two feasible ones the usual Pareto test decides.
+//
+// Why not simply score a stranded member as infinity: every infeasible individual would then
+// tie at infinity, so the GA could not tell "strands 1" from "strands 9" and would have no
+// gradient out of infeasibility. Ranking by violation keeps that gradient.
+static bool
 Dominates(const Individual& a, const Individual& b)
 {
+    if (a.stranded != b.stranded)
+    {
+        return a.stranded < b.stranded;
+    }
+    if (a.stranded > 0)
+    {
+        return false; // equally infeasible: neither dominates, objectives are meaningless here
+    }
+
     bool strictlyBetter = false;
     for (int i = 0; i < NUM_SLICES; ++i)
     {
@@ -46,7 +65,7 @@ Dominates(const Individual& a, const Individual& b)
     return strictlyBetter;
 }
 
-vector<vector<size_t>>
+static vector<vector<size_t>>
 FastNonDominatedSort(vector<Individual>& pop)
 {
     size_t n = pop.size();
@@ -110,7 +129,7 @@ FastNonDominatedSort(vector<Individual>& pop)
 // Lonely solutions (big gaps to their neighbors) score high and are preferred, so
 // the kept front stays spread out instead of clumping. It's the tie-breaker within
 // a front when we can't keep everyone.
-void
+static void
 AssignCrowding(vector<Individual>& pop, const vector<size_t>& front)
 {
     for (size_t i : front)
@@ -147,22 +166,6 @@ AssignCrowding(vector<Individual>& pop, const vector<size_t>& front)
             pop[idx[k]].crowd += (pop[idx[k + 1]].obj[m] - pop[idx[k - 1]].obj[m]) / span;
         }
     }
-}
-
-namespace {
-
-// Binary tournament on (rank, crowding): lower rank wins; tie -> larger crowd.
-size_t
-Tournament(const vector<Individual>& pop, mt19937& rng)
-{
-    uniform_int_distribution<size_t> pick(0, pop.size() - 1);
-    size_t a = pick(rng);
-    size_t b = pick(rng);
-    if (pop[a].rank != pop[b].rank)
-    {
-        return (pop[a].rank < pop[b].rank) ? a : b;
-    }
-    return (pop[a].crowd > pop[b].crowd) ? a : b;
 }
 
 // Order crossover (OX) on one permutation: keep a random slice of p1, fill the
@@ -221,11 +224,27 @@ SwapMutation(vector<uint32_t>& seg, double rate, mt19937& rng)
     swap(seg[pick(rng)], seg[pick(rng)]);
 }
 
+namespace {
+
+// Binary tournament on (rank, crowding): lower rank wins; tie -> larger crowd.
+size_t
+Tournament(const vector<Individual>& pop, mt19937& rng)
+{
+    uniform_int_distribution<size_t> pick(0, pop.size() - 1);
+    size_t a = pick(rng);
+    size_t b = pick(rng);
+    if (pop[a].rank != pop[b].rank)
+    {
+        return (pop[a].rank < pop[b].rank) ? a : b;
+    }
+    return (pop[a].crowd > pop[b].crowd) ? a : b;
+}
+
 Individual
 MakeChild(const Individual& p1,
           const Individual& p2,
           const Graph& g,
-          const array<SliceSpec, NUM_SLICES>& slices,
+          const array<Slice, NUM_SLICES>& slices,
           const Params& params,
           mt19937& rng)
 {
@@ -244,14 +263,23 @@ void
 ReportGen(uint32_t gen, const vector<Individual>& pop)
 {
     double be = -1e18, bu = 1e18, bm = 1e18; // eMBB max, URLLC min, mMTC min
+    size_t infeasible = 0;
+    int worstStranded = 0;
     for (const Individual& x : pop)
     {
         be = max(be, x.obj[0]);
         bu = min(bu, x.obj[1]);
         bm = min(bm, x.obj[2]);
+        if (x.stranded > 0)
+        {
+            ++infeasible;
+            worstStranded = max(worstStranded, x.stranded);
+        }
     }
     cout << "gen " << setw(3) << gen << " |  eMBB_max " << fixed << setprecision(3) << setw(8)
-         << be << "   URLLC_min " << setw(10) << bu << "   mMTC_min " << setw(3) << (int)bm << "\n";
+         << be << "   URLLC_min " << setw(10) << bu << "   mMTC_min " << setw(3) << (int)bm
+         << "   infeasible " << setw(3) << infeasible << "/" << pop.size() << " (worst "
+         << worstStranded << " stranded)\n";
 }
 
 void
@@ -285,7 +313,7 @@ DumpBestUrllc(uint32_t gen, const vector<Individual>& pop)
 
 vector<Individual>
 Run(const Graph& g,
-    const array<SliceSpec, NUM_SLICES>& slices,
+    const array<Slice, NUM_SLICES>& slices,
     const Params& p,
     mt19937& rng)
 {

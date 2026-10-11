@@ -15,6 +15,8 @@ using namespace std;
 
 namespace nsga {
 
+bool g_obj1Max = false;
+
 vector<double>
 FairShare(double R, const vector<double>& demand)
 {
@@ -82,7 +84,7 @@ DecodeSlice(const Graph& g, const vector<uint32_t>& perm)
     t.root = perm[0];
     inSet[t.root] = 1;
 
-    for (size_t k = 1; k < perm.size(); ++k)
+    for (size_t k = 0; k < perm.size(); ++k)
     {
         uint32_t m = perm[k];
         if (inSet[m])
@@ -105,10 +107,105 @@ DecodeSlice(const Graph& g, const vector<uint32_t>& perm)
     return t;
 }
 
+// Links on the unique path between a and b inside one tree. Parent pointers lead to the root,
+// so walk a up to the root, then walk b up until it meets that chain: the meeting point is the
+// lowest common ancestor and the two partial walks joined are the path. Empty means one endpoint
+// never joined the tree, i.e. the pair cannot communicate.
+static vector<EdgeKey>
+TreePath(const Tree& t, uint32_t a, uint32_t b, uint32_t NONE)
+{
+    if (a >= t.parent.size() || b >= t.parent.size())
+    {
+        return {};
+    }
+    auto ancestors = [&](uint32_t x) {
+        vector<uint32_t> up{x};
+        while (t.parent[x] != NONE)
+        {
+            x = t.parent[x];
+            up.push_back(x);
+        }
+        return up;
+    };
+    vector<uint32_t> upA = ancestors(a);
+    vector<uint32_t> upB = ancestors(b);
+    if (upA.back() != upB.back()) // different roots -> not in the same tree
+    {
+        return {};
+    }
+    // Drop the shared tail; what remains of each walk meets at the lowest common ancestor.
+    size_t ia = upA.size(), ib = upB.size();
+    while (ia > 1 && ib > 1 && upA[ia - 2] == upB[ib - 2])
+    {
+        --ia;
+        --ib;
+    }
+    vector<EdgeKey> path;
+    for (size_t i = 0; i + 1 < ia; ++i)
+    {
+        path.push_back(Key(upA[i], upA[i + 1]));
+    }
+    for (size_t i = 0; i + 1 < ib; ++i)
+    {
+        path.push_back(Key(upB[i], upB[i + 1]));
+    }
+    return path;
+}
+
+LinkAirtime
+SpreadDemand(const Graph& g,
+             const array<Tree, NUM_SLICES>& trees,
+             const array<Slice, NUM_SLICES>& slices)
+{
+    const uint32_t NONE = g.NumNodes();
+    LinkAirtime a;
+    for (int s = 0; s < NUM_SLICES; ++s)
+    {
+        auto pairs = slices[s].Pairs();
+        double perPair = pairs.empty() ? 0.0 : slices[s].demandMbps / pairs.size();
+        for (const auto& [x, y] : pairs)
+        {
+            vector<EdgeKey> path = TreePath(trees[s], x, y, NONE);
+            a.pairPaths[s].push_back(path);
+            for (const EdgeKey& e : path)
+            {
+                if (!a.onLink.count(e))
+                {
+                    a.used.push_back(e);
+                    a.onLink[e] = {0, 0, 0};
+                }
+                a.onLink[e][s] += perPair;
+            }
+        }
+    }
+    for (const EdgeKey& e : a.used)
+    {
+        array<double, NUM_SLICES> D = {0, 0, 0};
+        size_t n = 0;
+        for (const EdgeKey& f : a.used)
+        {
+            bool conflicts = g.Hears(e.first, f.first) || g.Hears(e.first, f.second) ||
+                             g.Hears(e.second, f.first) || g.Hears(e.second, f.second);
+            if (!conflicts)
+            {
+                continue;
+            }
+            ++n;
+            for (int s = 0; s < NUM_SLICES; ++s)
+            {
+                D[s] += a.onLink[f][s];
+            }
+        }
+        a.nbhd[e] = D;
+        a.nch[e] = n;
+    }
+    return a;
+}
+
 void
 Evaluate(Individual& ind,
          const Graph& g,
-         const array<SliceSpec, NUM_SLICES>& slices,
+         const array<Slice, NUM_SLICES>& slices,
          double C)
 {
     const double BIG = 1e6; // U>=1 -> link saturated: a flat huge delay penalty
@@ -128,28 +225,20 @@ Evaluate(Individual& ind,
     struct LinkLoad
     {
         array<double, NUM_SLICES> alloc = {0, 0, 0}; // fair-share throughput per slice
-        double effDelay = 0.0;                        // queueing delay on this link
+        double effDelay = 0.0;                       // queueing delay on this link
     };
     map<EdgeKey, LinkLoad> load;
-    map<EdgeKey, array<char, NUM_SLICES>> uses;
-
-    for (int s = 0; s < NUM_SLICES; ++s)
-    {
-        for (const EdgeKey& e : trees[s].links)
-        {
-            uses[e][s] = 1;
-        }
-    }
-    for (auto& [e, who] : uses)
+    LinkAirtime air = SpreadDemand(g, trees, slices);
+    for (const EdgeKey& e : air.used)
     {
         double R = g.GetLink(e.first, e.second).capacityMbps;
         vector<double> demands;
         vector<int> idx;
         for (int s = 0; s < NUM_SLICES; ++s)
         {
-            if (who[s])
+            if (air.nbhd[e][s] > 0.0)
             {
-                demands.push_back(slices[s].demandMbps);
+                demands.push_back(air.nbhd[e][s]);
                 idx.push_back(s);
             }
         }
@@ -158,6 +247,8 @@ Evaluate(Individual& ind,
         {
             U += d / R;
         }
+        // The neighbourhood shares one channel of capacity R, so the fair share is taken over
+        // the neighbourhood's demands rather than this link's alone.
         vector<double> a = FairShare(R, demands);
         LinkLoad ll;
         for (size_t i = 0; i < idx.size(); ++i)
@@ -168,28 +259,60 @@ Evaluate(Individual& ind,
         load[e] = ll;
     }
 
-    // Step 3: reduce each slice's tree to its one objective number.
+    // Step 3a: the feasibility constraint. A member whose parent pointer is NONE never reached
+    // its root, so its traffic goes nowhere. The root itself legitimately has no parent.
+    ind.stranded = 0;
+    for (int s = 0; s < NUM_SLICES; ++s)
+    {
+        for (uint32_t m : slices[s].members)
+        {
+            if (m != trees[s].root && trees[s].parent[m] == NONE)
+            {
+                ++ind.stranded;
+            }
+        }
+    }
+
+    // Step 3b: reduce each slice's tree to its one objective number.
     // obj[0] eMBB: bottleneck (min) fair-share throughput across its links.
     double embbMin = numeric_limits<double>::infinity();
-    for (const EdgeKey& e : trees[0].links)
+    for (const vector<EdgeKey>& path : air.pairPaths[0])
     {
-        embbMin = min(embbMin, load[e].alloc[0]);
+        for (const EdgeKey& e : path)
+        {
+            embbMin = min(embbMin, load[e].alloc[0]);
+        }
     }
     ind.obj[0] = isinf(embbMin) ? 0.0 : embbMin; // no eMBB links -> zero throughput
 
-    // obj[1] URLLC: worst member's summed path-to-root delay.
-    double urllcMax = 0.0;
-    for (uint32_t m : slices[1].members)
+    // obj[1] URLLC: MEAN over pairs of each pair's summed path delay.
+    //
+    // This was a max over pairs, and that is why Seng's scalar cost beat this one on every metric
+    // including this objective: a max prices only the single worst pair, so an individual may
+    // pile load onto every other path for free. Seng sums an exponential over all the slice's
+    // links and so pays for concentration everywhere. Summing here fixes the same blind spot.
+    //
+    // Mean rather than sum because the pair count is fixed for an instance, so the two differ
+    // only by that constant and rank identically - but the mean stays in milliseconds and can be
+    // read against the 10 ms target, while a sum cannot. A pair with no path contributes nothing
+    // and is handled by `stranded` through constraint domination.
+    double urllcSum = 0.0;
+    double urllcWorst = 0.0;
+    size_t urllcPairs = 0;
+    for (const vector<EdgeKey>& path : air.pairPaths[1])
     {
-        // walk parent pointers from this member up to the root, summing each hop's delay
         double d = 0.0;
-        for (uint32_t n = m; trees[1].parent[n] != NONE; n = trees[1].parent[n])
+        for (const EdgeKey& e : path)
         {
-            d += load[Key(n, trees[1].parent[n])].effDelay;
+            d += load[e].effDelay;
         }
-        urllcMax = max(urllcMax, d);
+        urllcSum += d;
+        urllcWorst = max(urllcWorst, d);
+        ++urllcPairs;
     }
-    ind.obj[1] = urllcMax;
+    // g_obj1Max keeps the old max available for the A/B that justifies the change; it is not a
+    // policy knob and the default is the repaired form.
+    ind.obj[1] = g_obj1Max ? urllcWorst : (urllcPairs ? (urllcSum / urllcPairs) : 0.0);
 
     // obj[2] mMTC: tree link count (scale/cost — mMTC is low-rate + delay-insensitive,
     // its concern is connecting many nodes cheaply; see PLAN.md §3).

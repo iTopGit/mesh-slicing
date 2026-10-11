@@ -23,18 +23,26 @@ struct Params
 
 // a dominates b iff no worse on every objective and strictly better on one
 // (each objective read in its own sense, OBJ_MAXIMIZE).
-bool Dominates(const Individual& a, const Individual& b);
 
 // Fast non-dominated sort: sets each individual's rank, returns fronts as index
 // lists (front 0 = Pareto-best).
-std::vector<std::vector<size_t>> FastNonDominatedSort(std::vector<Individual>& pop);
 
 // Crowding distance for one front, written into pop[i].crowd.
-void AssignCrowding(std::vector<Individual>& pop, const std::vector<size_t>& front);
 
 // Run NSGA-II; returns front 0 (Pareto set) of the final population.
+/**
+ * The GA's variation operators, shared so that every optimiser in this project searches with the
+ * SAME ones. The Seng baseline had its own copies and they were not equivalent - its crossover
+ * filled from index 0 while this one fills cyclically from the cut - which would have let a win in
+ * the comparison come from the operator rather than from the cost function being compared.
+ */
+std::vector<std::uint32_t> OrderCrossover(const std::vector<std::uint32_t>& p1,
+                                          const std::vector<std::uint32_t>& p2,
+                                          std::mt19937& rng);
+void SwapMutation(std::vector<std::uint32_t>& seg, double rate, std::mt19937& rng);
+
 std::vector<Individual> Run(const Graph& g,
-                            const std::array<SliceSpec, NUM_SLICES>& slices,
+                            const std::array<Slice, NUM_SLICES>& slices,
                             const Params& p,
                             std::mt19937& rng);
 

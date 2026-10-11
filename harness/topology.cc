@@ -46,6 +46,20 @@ BuildGridAdhocAxTopology(uint32_t gridWidth,
     ch << "{0, " << chWidth << ", BAND_5GHZ, 0}";
     phy.Set("ChannelSettings", StringValue(ch.str()));
 
+    // 20 dBm, not ns-3's 16.02 default: it is the highest permitted in Europe and the value
+    // "5G Network Slicing for Wi-Fi Networks" fixes for every slice. It also reproduces the
+    // ~80-100 Mb/s per link that the Seng mesh paper reports at this 50 m spacing, where the
+    // ns-3 default lands at roughly half that.
+    phy.Set("TxPowerStart", DoubleValue(20.0));
+    phy.Set("TxPowerEnd", DoubleValue(20.0));
+
+    // Defer only to nodes we share an edge with. At 20 dBm an axis neighbour (50 m) arrives at
+    // -77.65 dBm and a diagonal (70.7 m) at -82.15, so the threshold goes midway, -79.9; the
+    // attribute is 6 dB lower because ns-3 scales it by 10*log10(width/20MHz) for an 80 MHz
+    // channel (yans-wifi-channel.cc). Left at the -101 default a node hears ~189 m across a
+    // 200 m grid, so the whole field takes turns and the medium carries one link's worth.
+    phy.Set("RxSensitivity", DoubleValue(-86.0));
+
     // 802.11ax, ad-hoc mode (no AP, no association). IdealWifiManager picks the MCS
     // from known SNR — no adaptive-rate settling to wait out at warm-up.
     WifiHelper wifi;

@@ -92,16 +92,31 @@ Graph::FromLinkTable(const string& csvPath, uint32_t numNodes)
     return g;
 }
 
-bool
-Graph::HasLink(uint32_t a, uint32_t b) const
-{
-    return mLinks.count(Key(a, b)) > 0;
-}
-
 const Link&
 Graph::GetLink(uint32_t a, uint32_t b) const
 {
     return mLinks.at(Key(a, b));
+}
+
+bool
+Graph::Hears(uint32_t a, uint32_t b) const
+{
+    if (a == b)
+    {
+        return true;
+    }
+    if (a >= mNum || b >= mNum)
+    {
+        return false;
+    }
+    for (uint32_t v : mAdj[a])
+    {
+        if (v == b)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Dijkstra shortest path from `src` (weighted by base delay), but with an early

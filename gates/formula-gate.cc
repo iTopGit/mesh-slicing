@@ -92,6 +92,10 @@ main(int argc, char* argv[])
     // Three slice offered rates (Mb/s). Sweep these from a driver to move U across 1.
     double d1 = 20.0, d2 = 15.0, d3 = 10.0;
     double C = 4.53; // calibrated loaded-link delay constant (ms), avg of 5 pts U=0.27-0.79; PLAN.md §10
+    // The R probe overshoots the link by ~6x, so whatever it leaves queued is still draining when
+    // the slice flows start. Exposed as a knob to measure that contamination, not to tune it away.
+    double satRate = 300.0;
+    double sliceStart = 6.0;
     CommandLine cmd;
     cmd.AddValue("chWidth", "Channel width (MHz)", chWidth);
     cmd.AddValue("spacing", "Link length (m)", spacing);
@@ -99,6 +103,8 @@ main(int argc, char* argv[])
     cmd.AddValue("d2", "URLLC offered Mb/s", d2);
     cmd.AddValue("d3", "mMTC offered Mb/s", d3);
     cmd.AddValue("C", "Calibrated loaded-link delay constant (ms)", C);
+    cmd.AddValue("satRate", "R-probe offered rate (Mb/s)", satRate);
+    cmd.AddValue("sliceStart", "when the slice flows begin (s)", sliceStart);
     cmd.Parse(argc, argv);
 
     NodeContainer nodes;
@@ -135,18 +141,18 @@ main(int argc, char* argv[])
     Ipv4InterfaceContainer iface = addr.Assign(dev);
     Ipv4Address dst = iface.GetAddress(1);
 
-    // Ports: 4000 = L_base probe, 4001 = R probe, 5001/2/3 = the 3 slices.
-    AddFlow(nodes.Get(0), nodes.Get(1), dst, 4000, "1Mb/s", pktSize, 1.0, 2.0);   // L_base
-    AddFlow(nodes.Get(0), nodes.Get(1), dst, 4001, "300Mb/s", pktSize, 3.0, 5.0); // R (saturate)
     auto mbps = [](double m) { return to_string(m) + "Mb/s"; };
-    AddFlow(nodes.Get(0), nodes.Get(1), dst, 5001, mbps(d1), pktSize, 6.0, 9.0);
-    AddFlow(nodes.Get(0), nodes.Get(1), dst, 5002, mbps(d2), pktSize, 6.0, 9.0);
-    AddFlow(nodes.Get(0), nodes.Get(1), dst, 5003, mbps(d3), pktSize, 6.0, 9.0);
+    // Ports: 4000 = L_base probe, 4001 = R probe, 5001/2/3 = the 3 slices.
+    AddFlow(nodes.Get(0), nodes.Get(1), dst, 4000, "1Mb/s", pktSize, 1.0, 2.0);        // L_base
+    AddFlow(nodes.Get(0), nodes.Get(1), dst, 4001, mbps(satRate), pktSize, 3.0, 5.0);  // R (saturate)
+    AddFlow(nodes.Get(0), nodes.Get(1), dst, 5001, mbps(d1), pktSize, sliceStart, sliceStart + 3.0);
+    AddFlow(nodes.Get(0), nodes.Get(1), dst, 5002, mbps(d2), pktSize, sliceStart, sliceStart + 3.0);
+    AddFlow(nodes.Get(0), nodes.Get(1), dst, 5003, mbps(d3), pktSize, sliceStart, sliceStart + 3.0);
 
     FlowMonitorHelper fmh;
     Ptr<FlowMonitor> fm = fmh.InstallAll();
 
-    Simulator::Stop(Seconds(10.0));
+    Simulator::Stop(Seconds(sliceStart + 4.0));
     Simulator::Run();
 
     // Collect per-port throughput (Mb/s over the flow's active time) and mean delay (ms).
