@@ -4,7 +4,7 @@
 # Layout (files grouped by role, this CMake reaches into each subfolder):
 #   harness/  : the thesis testbed (per-layer files linked into one `main`)
 #   gates/    : standalone validation experiments, each its own main()
-#   fail/     : archived dead ends (dual-channel/dual-role), still buildable
+#   fail/     : archived dead ends (dual-channel/dual-role, superseded allocation), still buildable
 #   nsga/     : NSGA-II backbone (added as it's built)
 # Run as: ./ns3 run "mesh-slicing/main ..."  /  "mesh-slicing/formula-gate ..."
 
@@ -31,9 +31,8 @@ build_exec(
     ${CMAKE_CURRENT_SOURCE_DIR}/nsga/seng.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/nsga/nsga2.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/nsga/routing.cc
-    # OFDMA: allocator decides the RU shares, enforcement caps each source at its share.
+    # OFDMA: the allocator turns measured capacity + declared demands into per-slice shares.
     ${CMAKE_CURRENT_SOURCE_DIR}/ofdma/allocator.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/ofdma/enforcement.cc
   LIBRARIES_TO_LINK "${ns3-libs}" "${ns3-contrib-libs}"
   EXECUTABLE_DIRECTORY_PATH ${mesh_slicing_out}
 )
@@ -53,24 +52,8 @@ build_exec(
   EXECUTABLE_DIRECTORY_PATH ${mesh_slicing_out}
 )
 
-# Route-inject gate: needs the nsga core (BuildRoutes/Run) linked in, so it can't be
-# a single-file gate — build it explicitly with the nsga sources.
-build_exec(
-  EXECNAME route-inject-gate
-  EXECNAME_PREFIX scratch_mesh-slicing_
-  SOURCE_FILES
-    ${CMAKE_CURRENT_SOURCE_DIR}/gates/route-inject-gate.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/nsga/graph.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/nsga/fitness.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/nsga/seng.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/nsga/nsga2.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/nsga/routing.cc
-  LIBRARIES_TO_LINK "${ns3-libs}" "${ns3-contrib-libs}"
-  EXECUTABLE_DIRECTORY_PATH ${mesh_slicing_out}
-)
-
 # OFDMA gates: need the ofdma allocator linked in, so build them explicitly (not single-file).
-foreach(ogate ofdma-gate ofdma-enforce-gate ofdma-dynamic-gate)
+foreach(ogate ofdma-gate)
   build_exec(
     EXECNAME ${ogate}
     EXECNAME_PREFIX scratch_mesh-slicing_
@@ -98,7 +81,7 @@ foreach(qgate capacity-feedback-gate slice-qdisc-gate alloc-gate)
 endforeach()
 
 # Standalone gate tests: each a single-file program with its own main().
-foreach(gate adhoc-ax-test formula-gate slice-shape-gate encoding-gate)
+foreach(gate formula-gate)
   build_exec(
     EXECNAME ${gate}
     EXECNAME_PREFIX scratch_mesh-slicing_
@@ -110,6 +93,20 @@ endforeach()
 
 # fail/ : the dual-channel / dual-role dead end (fail/DualChannel.md). Kept building so
 # the measurements stay reproducible, but nothing in harness/, nsga/ or ofdma/ uses them.
+# fail/ofdma-dynamic-gate: superseded rather than merely unwired. It senses DEMAND changing and
+# retunes the SOURCE rate with R as a given constant; harness/controller.cc senses radio backlog
+# and retunes the per-node BUCKET rates, which is the quantity that actually had to change. Needs
+# the allocator linked, so it gets its own block.
+build_exec(
+  EXECNAME ofdma-dynamic-gate
+  EXECNAME_PREFIX scratch_mesh-slicing_
+  SOURCE_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/fail/ofdma-dynamic-gate.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/ofdma/allocator.cc
+  LIBRARIES_TO_LINK "${ns3-libs}" "${ns3-contrib-libs}"
+  EXECUTABLE_DIRECTORY_PATH ${mesh_slicing_out}
+)
+
 foreach(gate dual-role-gate hop-delay-gate star-ofdma-gate ring-bss-gate grid-dualrole-gate)
   build_exec(
     EXECNAME ${gate}

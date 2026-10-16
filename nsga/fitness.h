@@ -16,6 +16,11 @@ namespace nsga {
 // the old form, kept so the repair can be measured against it on one build.
 extern bool g_obj1Max;
 
+// Score obj[0] as the old allocated rate instead of bottleneck spare capacity. Measurement-only,
+// same role as g_obj1Max: the allocated form is provably degenerate below saturation and is kept
+// only so the repair can be measured against it on one build.
+extern bool g_obj0Alloc;
+
 // Ordered mesh-edge key (endpoints stored a < b so each link has one key).
 using EdgeKey = std::pair<uint32_t, uint32_t>;
 
@@ -73,13 +78,13 @@ std::vector<double> FairShare(double R, const std::vector<double>& demand);
 
 // Decode the 3 permutations into 3 co-existing trees, overlay joint airtime
 // contention per shared link, and write the 3 objectives into ind.obj:
-//   obj[0] eMBB  = min fair-share throughput across its tree (bottleneck, maximize)
+//   obj[0] eMBB  = min SPARE CAPACITY R(1-U) across its pair paths (bottleneck, maximize)
 //   obj[1] URLLC = worst member's summed path delay C/(1-U) (minimize)
 //   obj[2] mMTC  = tree link count (scale/cost, minimize)
 void Evaluate(Individual& ind,
               const Graph& g,
               const std::array<Slice, NUM_SLICES>& slices,
-              double C);
+              double t0Ms);
 
 } // namespace nsga
 

@@ -40,6 +40,21 @@ class Graph
      * `RxSensitivity = -86` precisely so a node hears its axis neighbours (50 m) and not the
      * diagonals (70.7 m) - so "can hear" and "shares a graph edge" are the same relation here.
      */
+    // Mean shortest-path delay and hop count over EVERY ordered pair of nodes -- a property of
+    // the topology alone, with no slice, no route and no traffic in it. This is what `D` in
+    // `H = T*/(T* - D)` is built from: allocation must not read routing's output (CLAUDE.md), so
+    // the headroom is derived from the mesh's own character rather than from the GA's chosen path.
+    // The cost is that a path longer than the mean is under-provisioned, which is a declarable
+    // limit; the alternative welds the allocator to the router.
+    struct PathMeans
+    {
+        double delayMs = 0.0;
+        double hops = 0.0;
+        bool connected = false;
+    };
+
+    PathMeans AllPairsMean() const;
+
     bool Hears(uint32_t a, uint32_t b) const;
 
   private:

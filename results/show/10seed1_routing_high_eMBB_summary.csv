@@ -1,0 +1,5 @@
+slice,load_mbps,arm,n,delay_mean_ms,delay_sd_ms,delay_ci95_ms,throughput_mean_mbps,throughput_sd_mbps,throughput_ci95_mbps,discarded_invalid
+eMBB,10,NSGA-II,5,104.1,41.6,36.5,10.50,0.05,0.04,0
+eMBB,10,EA (Seng),4,239.3,295.4,289.5,10.65,0.29,0.29,1
+eMBB,16,NSGA-II,5,301.5,113.9,99.8,17.14,0.28,0.24,0
+eMBB,16,EA (Seng),3,1173.5,188.3,213.1,13.52,2.00,2.26,2

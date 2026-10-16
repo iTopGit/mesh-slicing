@@ -1,0 +1,5 @@
+slice,load_mbps,arm,n,delay_mean_ms,delay_sd_ms,delay_ci95_ms,throughput_mean_mbps,throughput_sd_mbps,throughput_ci95_mbps,discarded_invalid
+URLLC,10,NSGA-II,5,64.6,29.0,25.4,10.46,0.03,0.03,0
+URLLC,10,EA (Seng),4,186.3,209.9,205.7,10.55,0.15,0.15,1
+URLLC,16,NSGA-II,5,242.2,146.2,128.2,17.03,0.23,0.20,0
+URLLC,16,EA (Seng),3,1017.3,91.3,103.4,13.72,0.40,0.45,2

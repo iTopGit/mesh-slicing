@@ -84,41 +84,24 @@ const char* PRIOMAP = "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
 // elapsed time on demand (tbf-queue-disc.cc:202), so there is no tick to cover. See Alloc.md 4.6.
 const uint32_t MTU_BYTES = 1500;
 
-// URLLC's queue depth is a PACKET COUNT derived from its loss target, not a delay budget.
-//
-// The old rule was `budget x rate`, i.e. the depth a delay budget pays for. It fails because at
-// URLLC's small per-node rate (0.6-1.2 Mb/s measured) a 6.1 ms budget buys 1.7 packets, the MTU
-// floor rounds it to 2, and a two-slot queue dropped 35% of URLLC's own packets while eMBB and
-// mMTC (on ns-3's 1000p default) dropped none. Its deeper problem: the budget came from an M/M/1
-// delay argument, and M/M/1 assumes an INFINITE buffer, so the derivation never covered the
-// buffer it was sizing. See Alloc.md 4c.3b.
-//
-// A drop happens when more packets arrive at once than there are slots. That is counting, not
-// timing, so the depth is counted in packets and the delay it causes is REPORTED rather than
-// commanded. Both inputs are already in the design, so this adds no chosen number:
-//
-//   rho* = 1 - T0/T* = 0.61                    the utilization the headroom already targets
-//   PLR <= 1e-5                                IEEE 802.11 RTA TIG, via Bankov et al.
-//                                              (the same sentence that gives T* = 10 ms)
-//
-// For a finite buffer of K slots, loss falls by a factor of rho per slot: loss ~ (1-rho) rho^K.
-// A packet crosses ~3.4 hops, so each hop may lose at most 1e-5/3.4 = 2.9e-6, which needs K = 24
-// (K = 23 gives 4.5e-6 per hop = 1.5e-5 end to end and misses). 24 is the minimum that meets the
-// cited target, not a round number.
-//
-// The formula assumes Poisson arrivals and ours are superposed constant-rate flows, which cluster
-// worse: at K = 10 it predicted 0.95% end to end and the harness measured 3.3%, about 3x. So the
-// formula picks the starting K and the sweep below settles it.
-uint32_t g_urllcQueuePkts = 24;
-
 // A TbfQueueDisc's Rate is set-only, so the installed cap cannot be read back off the disc; it
 // is recorded here as it is written. All three slices, because "is the cap binding?" is a
 // question about every slice, not only URLLC.
-vector<array<double, NUM_SLICES>> g_lastCapMbps;
+vector<array<double, NUM_SLICES>> g_lastLimitMbps;
 
-// eMBB and mMTC have no delay budget, so nothing derives a depth for them: they keep ns-3's
-// default (1000p) by simply not being given one. "Unchanged from the simulator's default" is a
-// stronger defence than any number chosen here, and it replaces the invented 200p.
+// All three slices keep ns-3's default depth (1000p) by simply not being given one. "Unchanged
+// from the simulator's default" is a stronger defence than any number chosen here, and it replaces
+// the invented 200p.
+//
+// Equal across slices since 2026-10-13 (user's choice of the two honest options). Depth decides
+// which SYMPTOM congestion produces - a deep bucket makes a burst wait, a shallow one throws it
+// away - so URLLC on a derived 13 against eMBB and mMTC on 1000 made their loss figures products
+// of the buffer rather than of the allocation. The claim under test ("URLLC degrades last") is
+// about RATE, so rate is what may differ between slices and depth is what must not. The cost is
+// named rather than hidden: at URLLC's measured per-node caps 1000p is 1.3-6.7 s of buffer against
+// a 10 ms target, so its congestion now shows up as delay instead of loss. The alternative - the
+// derived K for all three - would have borrowed URLLC's PLR target for two slices that have none,
+// which is the borrowing that killed 1.64 and 24.
 //
 // Measured both ways (alloc-gate baseline, 2026-10-05) before settling on the default: 1000p vs
 // 200p moves eMBB's own delay (655 vs 219 ms) and NOTHING else -- C settles at 39.75 either way,
@@ -126,8 +109,22 @@ vector<array<double, NUM_SLICES>> g_lastCapMbps;
 // bucket's output rate is the same whatever is queued behind it. So the cost of the default falls
 // entirely on the one slice with no delay requirement, which is where it belongs.
 
-// Smallest cap a token bucket can be given; see SetSliceRates.
-const double MIN_SHARE_MBPS = 0.01;
+// Smallest cap a token bucket may be given. DERIVED, not chosen: a bucket must pass at least one
+// maximum-size packet between controller retunes, or it cannot make progress before the rate is
+// looked at again, and its backlog is effectively frozen. So the floor is one MTU per control
+// period -- 1500 B x 8 / 0.5 s = 24 kb/s = 0.024 Mb/s at the default period, and it FOLLOWS
+// --ctrlPeriod rather than being frozen at that value.
+//
+// It replaced a typed-in 0.01 Mb/s on 2026-10-14. That value was 2.4x slower and measurably too
+// slow: at 13 Mb/s a bucket on the old floor still held 91 packets when the 120 s drain cap hit,
+// because a 728 B packet needs 0.58 s to clear at 0.01 Mb/s.
+const double CTRL_PERIOD_DEFAULT_SEC = 0.5;
+double g_minLimitMbps = MTU_BYTES * 8.0 / CTRL_PERIOD_DEFAULT_SEC / 1e6;
+
+// The Tbf's child discipline. Cobalt by default, for the reasons in InstallSliceQdiscs; Fifo is
+// what a Tbf builds for itself, so it is the arm carrying no latency policy at all. Both are
+// peek-safe, which FqCoDel and CoDel are not -- that list is the hard constraint here, not taste.
+std::string g_sliceAqm = "ns3::CobaltQueueDisc";
 
 } // namespace
 
@@ -139,16 +136,52 @@ InstallSliceQdiscs(const NetDeviceContainer& devices)
     tch.AddPacketFilter(h, "ns3::SliceBandFilter");
     TrafficControlHelper::ClassIdList cls = tch.AddQueueDiscClasses(h, 4, "ns3::QueueDiscClass");
     tch.AddChildQueueDisc(h, cls[SLICE_BAND_CTRL], "ns3::FifoQueueDisc");
-    // URLLC: shallow, because a deep queue converts a burst into latency instead of a drop. The
-    // depth is a placeholder here -- SetSliceRates sizes it from the delay budget and the rate.
-    tch.AddChildQueueDisc(h, cls[SLICE_BAND[1]], "ns3::TbfQueueDisc", "Burst",
-                          UintegerValue(MTU_BYTES), "MaxSize",
-                          QueueSizeValue(QueueSize(PACKETS, g_urllcQueuePkts)));
-    // eMBB and mMTC: MaxSize deliberately not given, so each keeps ns-3's 1000p default.
-    tch.AddChildQueueDisc(h, cls[SLICE_BAND[0]], "ns3::TbfQueueDisc", "Burst",
-                          UintegerValue(MTU_BYTES));
-    tch.AddChildQueueDisc(h, cls[SLICE_BAND[2]], "ns3::TbfQueueDisc", "Burst",
-                          UintegerValue(MTU_BYTES));
+    // MaxSize deliberately not given on any slice band, so all three keep ns-3's 1000p default.
+    //
+    // Each Tbf gets an EXPLICIT FqCoDel child instead of the Fifo it would create for itself
+    // (tbf-queue-disc.cc:302). The Tbf still owns the slice's RATE; the child owns the slice's
+    // LATENCY, and the two are different jobs. With the default Fifo all 12 flows of a slice share
+    // one 1000-packet line that has no packet lifetime and nothing to reap it, so the queue grows
+    // until it is full and every packet behind it pays the whole depth: measured 103 packets per
+    // hop at 9 Mb/s per slice and 257 at 12, which is the 464 ms and 958 ms URLLC figures, at
+    // 0.00% loss. A buffer doing exactly what it was configured to do.
+    //
+    // Cobalt replaces it: a sojourn-TIME AQM (Target 5ms, Interval 100ms -- ns-3's defaults, which
+    // are Nichols & Jacobson's published CoDel values, so cited rather than invented), so the
+    // queue is bounded in milliseconds instead of packets.
+    //
+    // It cannot weaken the slicing: the Prio root has already sorted by slice ID, so a band's AQM
+    // only ever sees that one slice's traffic. The no-slicing baseline puts a single FqCoDel on
+    // the raw device, where it sees all 36 flows of all three slices and cannot tell them apart.
+    //
+    // FqCoDel was tried here FIRST and must not be retried: TbfQueueDisc needs a child with a
+    // non-destructive DoPeek, because it reads the head packet's SIZE to decide whether it has
+    // tokens (tbf-queue-disc.cc:191). FqCoDel and CoDel do not override DoPeek, so they inherit
+    // the base one, which "peeks" by DEQUEUING into m_requeued -- and since Tbf is
+    // SINGLE_CHILD_QUEUE_DISC its reported size IS the child's, so it reads 0 packets while still
+    // holding one. That spins at 100% CPU forever: measured on the 3-node slice-qdisc-gate, 25 s
+    // elapsed for 24 s of CPU and no output, where it normally finishes in seconds.
+    // Peek-safe discs are Fifo, Cobalt, Red, PfifoFast, Prio and Mq; Cobalt is the only
+    // sojourn-time AQM among them, hence this choice. The cost is named: Cobalt gives the latency
+    // bound but NOT per-flow isolation, so head-of-line blocking between a slice's own 12 flows
+    // remains, and the baseline keeps that one advantage.
+    //
+    // Identical on all three bands: rates may differ between slices, latency policy must not,
+    // or a loss or delay comparison across slices reads the queue config instead of the design.
+    for (int s = 0; s < NUM_SLICES; ++s)
+    {
+        uint16_t tbf = tch.AddChildQueueDisc(h, cls[SLICE_BAND[s]], "ns3::TbfQueueDisc", "Burst",
+                                             UintegerValue(MTU_BYTES));
+        TrafficControlHelper::ClassIdList inner =
+            tch.AddQueueDiscClasses(tbf, 1, "ns3::QueueDiscClass");
+        // MaxSize must be given explicitly. TbfQueueDisc copies its own 1000p onto the child only
+        // in the branch where it CREATES that child (tbf-queue-disc.cc:309); supplying one skips
+        // that, so the child would otherwise keep its own default and silently change the depth
+        // as well as the discipline. Pinned to the 1000p the Fifo had, so the only difference is
+        // the discipline (rule 6). Cobalt should hold real occupancy far below this backstop.
+        tch.AddChildQueueDisc(tbf, inner[0], g_sliceAqm, "MaxSize",
+                              QueueSizeValue(QueueSize("1000p")));
+    }
     QueueDiscContainer qdiscs = tch.Install(devices);
 
     for (uint32_t i = 0; i < qdiscs.GetN(); ++i)
@@ -175,47 +208,73 @@ InstallSliceQdiscs(const NetDeviceContainer& devices)
 }
 
 void
+SetSliceAqm(const string& typeId)
+{
+    g_sliceAqm = typeId;
+}
+
+void
+SetSliceLatencyTargets(const QueueDiscContainer& qdiscs, double targetSec)
+{
+    // Only a sojourn-time AQM has a Target; a Fifo child has no such attribute and SetAttribute
+    // would abort rather than be ignored.
+    if (g_sliceAqm != "ns3::CobaltQueueDisc")
+    {
+        return;
+    }
+    for (uint32_t i = 0; i < qdiscs.GetN(); ++i)
+    {
+        for (int s = 0; s < NUM_SLICES; ++s)
+        {
+            Ptr<QueueDisc> tbf =
+                qdiscs.Get(i)->GetQueueDiscClass(SLICE_BAND[s])->GetQueueDisc();
+            // The AQM is the Tbf's single child; see InstallSliceQdiscs for why it is Cobalt.
+            if (tbf->GetNQueueDiscClasses() == 1)
+            {
+                tbf->GetQueueDiscClass(0)->GetQueueDisc()->SetAttribute(
+                    "Target", TimeValue(Seconds(targetSec)));
+            }
+        }
+    }
+}
+
+void
 SetSliceRatesOn(const QueueDiscContainer& qdiscs,
                 uint32_t index,
-                const array<double, NUM_SLICES>& shareMbps)
+                const array<double, NUM_SLICES>& limitMbps)
 {
     for (int s = 0; s < NUM_SLICES; ++s)
     {
         // A zero share is a legitimate allocator output (an over-subscribed link leaves the
         // elastic slice nothing), but a TbfQueueDisc divides by its rate to work out when the
         // next token arrives, so rate 0 is SIGFPE. Floor it: "almost nothing" not "nothing".
-        uint64_t bps = static_cast<uint64_t>(max(shareMbps[s], MIN_SHARE_MBPS) * 1e6);
+        uint64_t bps = static_cast<uint64_t>(max(limitMbps[s], g_minLimitMbps) * 1e6);
         Ptr<QueueDisc> band = qdiscs.Get(index)->GetQueueDiscClass(SLICE_BAND[s])->GetQueueDisc();
         band->SetAttribute("Rate", DataRateValue(DataRate(bps)));
-        if (g_lastCapMbps.size() <= index)
+        if (g_lastLimitMbps.size() <= index)
         {
-            g_lastCapMbps.resize(index + 1, {});
+            g_lastLimitMbps.resize(index + 1, {});
         }
-        g_lastCapMbps[index][s] = bps / 1e6;
-        if (s == 1)
-        {
-        }
-
-        // URLLC's depth follows its rate, so that the queue can never hold more than the delay
-        // budget's worth of work. Two floors, both forced rather than chosen: one MTU, or a
-        // full-size packet never fits; and whatever the queue is holding right now, because ns-3
-        // aborts on a MaxSize below the current occupancy (queue.cc:201). The second floor is a
-        // transient -- the next retune reaches the target once the backlog has drained.
+        g_lastLimitMbps[index][s] = bps / 1e6;
     }
 }
 
 void
-SetUrllcQueuePackets(uint32_t packets)
+SetMinLimitFromPeriod(double periodSec)
 {
-    g_urllcQueuePkts = max(1u, packets);
+    if (periodSec > 0.0)
+    {
+        g_minLimitMbps = MTU_BYTES * 8.0 / periodSec / 1e6;
+    }
 }
 
+
 void
-SetSliceRates(const QueueDiscContainer& qdiscs, const array<double, NUM_SLICES>& shareMbps)
+SetSliceRates(const QueueDiscContainer& qdiscs, const array<double, NUM_SLICES>& limitMbps)
 {
     for (uint32_t i = 0; i < qdiscs.GetN(); ++i)
     {
-        SetSliceRatesOn(qdiscs, i, shareMbps);
+        SetSliceRatesOn(qdiscs, i, limitMbps);
     }
 }
 
@@ -230,6 +289,24 @@ SliceOfferedBytes(const QueueDiscContainer& qdiscs, uint32_t index)
                        ->GetQueueDisc()
                        ->GetStats()
                        .nTotalReceivedBytes;
+    }
+    return bytes;
+}
+
+array<uint64_t, NUM_SLICES>
+SliceBacklogBytes(const QueueDiscContainer& qdiscs, uint32_t index)
+{
+    array<uint64_t, NUM_SLICES> bytes{};
+    for (int s = 0; s < NUM_SLICES; ++s)
+    {
+        // The Tbf stores nothing itself (tbf-queue-disc.cc:292), but AddQueueDiscClass wires the
+        // child's Enqueue/Dequeue traces into the parent's counters, so the Tbf's own GetNBytes()
+        // reports what its child is holding. Only GetMaxSize() delegates to the child; this does
+        // not, and does not need to.
+        bytes[s] = qdiscs.Get(index)
+                       ->GetQueueDiscClass(SLICE_BAND[s])
+                       ->GetQueueDisc()
+                       ->GetNBytes();
     }
     return bytes;
 }
@@ -288,8 +365,9 @@ PrintCapVsOffered(const QueueDiscContainer& qdiscs, double spanSec)
     // would divide the offered load by ~16 and make every node look idle.
     double span = (spanSec > 0.0) ? spanSec : Simulator::Now().GetSeconds();
 
-    cout << "\n=== cap vs offered, per slice (nodes carrying the slice) ===\n";
-    cout << "slice  nodes  mean cap  mean offered  mean off/cap  max off/cap  nodes over cap\n";
+    cout << "\n=== limit vs offered, per slice (nodes carrying the slice) ===\n";
+    cout << "slice  nodes  mean limit  mean offered  mean off/limit  max off/limit  nodes over "
+            "limit\n";
     for (int s = 0; s < NUM_SLICES; ++s)
     {
         uint32_t nodes = 0, over = 0;
@@ -302,7 +380,7 @@ PrintCapVsOffered(const QueueDiscContainer& qdiscs, double spanSec)
             {
                 continue;
             }
-            double cap = (i < g_lastCapMbps.size()) ? g_lastCapMbps[i][s] : 0.0;
+            double cap = (i < g_lastLimitMbps.size()) ? g_lastLimitMbps[i][s] : 0.0;
             double offered = (span > 0) ? (st.nTotalReceivedBytes * 8.0 / span / 1e6) : 0.0;
             double ratio = (cap > 0) ? offered / cap : 0.0;
             ++nodes;
@@ -317,8 +395,10 @@ PrintCapVsOffered(const QueueDiscContainer& qdiscs, double spanSec)
              << ratioMax << "  " << over << "\n";
     }
 
-    cout << "\n=== URLLC per node (cap vs offered) ===\n";
-    cout << "node  cap(Mb/s)  offered(Mb/s)  enq  drop  K(pkt)  held(pkt)\n";
+    cout << "\n=== URLLC per node (limit vs offered) ===\n";
+    // "depth", not "K": since the depths were equalised this is the installed MaxSize, which is
+    // ns-3's default unless --urllcQueuePkts overrode it, and no longer the derived K.
+    cout << "node  limit(Mb/s)  offered(Mb/s)  enq  drop  depth(pkt)  held(pkt)\n";
     for (uint32_t i = 0; i < qdiscs.GetN(); ++i)
     {
         Ptr<QueueDisc> band = qdiscs.Get(i)->GetQueueDiscClass(SLICE_BAND[1])->GetQueueDisc();
@@ -327,7 +407,7 @@ PrintCapVsOffered(const QueueDiscContainer& qdiscs, double spanSec)
         {
             continue;
         }
-        double cap = (i < g_lastCapMbps.size()) ? g_lastCapMbps[i][1] : -1.0;
+        double cap = (i < g_lastLimitMbps.size()) ? g_lastLimitMbps[i][1] : -1.0;
         double offered = (span > 0) ? (st.nTotalReceivedBytes * 8.0 / span / 1e6) : 0.0;
         // K is the installed bucket size, held is what is in it now -- the old single "depth"
         // column printed K and so read 24 on every node whether the bucket was full or empty.

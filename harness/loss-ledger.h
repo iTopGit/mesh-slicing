@@ -4,6 +4,7 @@
 #include "topology.h"
 
 #include <cstdint>
+#include <string>
 
 /**
  * Names every packet the medium destroys, so a loss figure stops being "somewhere below us".
@@ -42,6 +43,29 @@ std::uint32_t HeldPackets(const MeshTopology& mesh,
                           std::uint32_t* inQdiscs = nullptr,
                           std::uint32_t* inRadios = nullptr);
 
+/** Sweep every radio's expired MPDUs now. See the comment on the definition. */
+void ReapExpired(const MeshTopology& mesh);
+
+/**
+ * Watch the held-packet count from `startSec` so the measurement window can tell whether the
+ * queues had reached equilibrium before it opened. Queues at equilibrium means arrivals equal
+ * departures, which means occupancy stops RISING -- the same observable the drain uses, so this
+ * introduces no new constant.
+ */
+void ScheduleSettleWatch(const MeshTopology& mesh,
+                         double startSec,
+                         double pollSec = 0.05,
+                         double stallSec = 2.0);
+
+/**
+ * Occupancy over the traffic so far, as a printable line: recent mean, whole-traffic mean, peak
+ * and their ratio. Call once, as the window opens -- it stops the watcher. REPORTED, not judged:
+ * see the comment block in loss-ledger.cc for the two boolean versions that failed and why a
+ * yes/no needs a tolerance constant this project will not invent. Steady state is established by
+ * agreement between nested measurement windows, not by this line.
+ */
+std::string OccupancyTrend(double stallSec);
+
 /**
  * End the run when the queues are empty rather than after a fixed quiet time.
  *
@@ -51,11 +75,17 @@ std::uint32_t HeldPackets(const MeshTopology& mesh,
  * every delay and loss figure taken that way is truncated. So keep the requirement and drop the
  * constant. Polls from `startSec` every `pollSec`, stops as soon as nothing is held, and gives up
  * at `capSec` - which is a safety limit, not a drain time.
+ *
+ * `stallSec` is how long the held count may sit UNCHANGED before the queues are declared
+ * not-draining; it is exposed so the verdict's independence from it can be demonstrated rather
+ * than asserted. See the comment on `g_stallSec` in loss-ledger.cc.
  */
 void ScheduleDrain(const MeshTopology& mesh,
                    double startSec,
                    double pollSec = 0.05,
-                   double capSec = 120.0);
+                   double capSec = 300.0,
+                   double stallSec = 2.0,
+                   bool reap = true);
 
 /**
  * Report the drain: how long the queues took to empty, or that the run is INVALID because the cap

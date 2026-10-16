@@ -109,18 +109,22 @@ SnapRWindowEnd(WarmupContext* ctx, size_t edgeIdx, double dur)
     }
 }
 
-// Schedule one edge's isolated sweep at sim time `t`: prime (unmeasured, resolves
-// ARP + lets the queue settle so it doesn't corrupt the measurement), then L
-// (empty → base_delay), then R (saturating → capacity). One window each, a -> b,
-// on fresh ports. Advances s->nextPort; returns the sim time it ends.
+// Schedule one edge's isolated sweep at sim time `t`: L (empty -> base_delay), then R (saturating
+// -> capacity). One window each, a -> b, on fresh ports. Advances s->nextPort; returns the sim
+// time it ends.
+//
+// There used to be an unmeasured low-rate PRIME window before L, doing two jobs that are now both
+// done elsewhere: resolving ARP, which `PerfectArp` does at setup before any warm-up runs, and
+// letting the queue settle, which `FlushSender` does between edges. Removed 2026-10-14 along with
+// its `primeSec`/`primeRate` knobs. It was ~18 packets against the R window's ~10,700, so this is
+// tidiness, not speed - warm-up wall time is the R probe and nothing else.
 static double
 ScheduleEdgeWindows(WarmupSession* s, size_t edgeIdx, double t)
 {
 
-    const string lRate = "1Mb/s";        // low → link stays ~empty → base_delay
-    const string rRate = s->satRate;     // above link ceiling → saturates → R
-    const double primeSec = s->primeSec; // ARP resolve + queue settle before measuring
-    const double guard = s->guardSec;    // drain queue + channel between windows
+    const string lRate = "1Mb/s";    // low -> link stays ~empty -> base_delay
+    const string rRate = s->satRate; // above link ceiling -> saturates -> R
+    const double guard = s->guardSec; // drain queue + channel between windows
 
     uint32_t a = s->edges[edgeIdx].first;
     uint32_t b = s->edges[edgeIdx].second;
@@ -128,15 +132,8 @@ ScheduleEdgeWindows(WarmupSession* s, size_t edgeIdx, double t)
     // start time as a delay from *now*. So schedule relative to now, not absolute,
     // or a retry installed at t=now would fire at now+now and miss the sim window.
     double now = Simulator::Now().GetSeconds();
-    struct SubWindow { string rate; double dur; int phase; }; // phase -1 = prime, unmeasured
-    // Prime is low-rate (primeRate): it only needs to resolve ARP. A high-rate prime
-    // would flood the MAC queue, and the following L (base-delay) window would then
-    // measure the drain, not the link. primeSec <= 0 skips the prime entirely.
+    struct SubWindow { string rate; double dur; int phase; };
     vector<SubWindow> subs;
-    if (primeSec > 0.0)
-    {
-        subs.push_back({s->primeRate, primeSec, -1});
-    }
     subs.push_back({lRate, s->windowSec, 0});
     subs.push_back({rRate, s->windowSec, 1});
     for (const SubWindow& sw : subs)
@@ -191,6 +188,45 @@ Distance(const MeshTopology& mesh, uint32_t u, uint32_t v)
     Vector pu = mesh.nodes.Get(u)->GetObject<MobilityModel>()->GetPosition();
     Vector pv = mesh.nodes.Get(v)->GetObject<MobilityModel>()->GetPosition();
     return CalculateDistance(pu, pv);
+}
+
+vector<Edge>
+SampleEdgesByPosition(const MeshTopology& mesh, const vector<Edge>& all, uint32_t want)
+{
+    // Rank edges by how far the midpoint sits from the field centre, then take `want` evenly
+    // spaced ranks. That spans interior -> edge -> corner without needing the grid width, and it
+    // is deterministic, so the same topology always yields the same sample. Spread is the point:
+    // a sample clustered in the interior could not DETECT a position effect, only assume none.
+    const uint32_t n = mesh.nodes.GetN();
+    Vector centre(0.0, 0.0, 0.0);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        Vector p = mesh.nodes.Get(i)->GetObject<MobilityModel>()->GetPosition();
+        centre.x += p.x / n;
+        centre.y += p.y / n;
+    }
+
+    vector<pair<double, size_t>> ranked;
+    ranked.reserve(all.size());
+    for (size_t e = 0; e < all.size(); ++e)
+    {
+        Vector a = mesh.nodes.Get(all[e].first)->GetObject<MobilityModel>()->GetPosition();
+        Vector b = mesh.nodes.Get(all[e].second)->GetObject<MobilityModel>()->GetPosition();
+        Vector mid((a.x + b.x) / 2.0, (a.y + b.y) / 2.0, 0.0);
+        ranked.emplace_back(CalculateDistance(mid, centre), e);
+    }
+    sort(ranked.begin(), ranked.end());
+
+    vector<Edge> picked;
+    for (uint32_t k = 0; k < want; ++k)
+    {
+        // Evenly spaced ranks, both ends included; want == 1 takes the most interior edge.
+        size_t r = (want == 1) ? 0 : (k * (ranked.size() - 1)) / (want - 1);
+        picked.push_back(all[ranked[r].second]);
+    }
+    cout << "edge sample: " << picked.size() << " of " << all.size()
+         << " edges, spread by distance from field centre" << endl;
+    return picked;
 }
 
 vector<Edge>
@@ -281,6 +317,10 @@ void
 BeginWarmup(WarmupSession* s)
 {
     s->edges = BuildEdgeListGeometric(s->mesh);
+    if (s->sampleEdges > 0 && s->sampleEdges < s->edges.size())
+    {
+        s->edges = SampleEdgesByPosition(s->mesh, s->edges, s->sampleEdges);
+    }
     s->ctx.edges = s->edges;
     s->ctx.traceR = s->traceR;
     s->ctx.pktSize = s->pktSize;

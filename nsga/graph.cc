@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <fstream>
 #include <limits>
+#include <cmath>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -96,6 +97,72 @@ const Link&
 Graph::GetLink(uint32_t a, uint32_t b) const
 {
     return mLinks.at(Key(a, b));
+}
+
+Graph::PathMeans
+Graph::AllPairsMean() const
+{
+    // Dijkstra from every node, weighted by the measured base delay, accumulating both the delay
+    // and the hop count of each shortest path. O(n^2 log n) and run once per topology.
+    const double INF = numeric_limits<double>::infinity();
+    PathMeans out;
+    double delaySum = 0.0, hopSum = 0.0;
+    size_t pairs = 0;
+    bool allReachable = true;
+
+    for (uint32_t src = 0; src < mNum; ++src)
+    {
+        vector<double> dist(mNum, INF);
+        vector<uint32_t> hops(mNum, 0);
+        dist[src] = 0.0;
+        priority_queue<pair<double, uint32_t>,
+                       vector<pair<double, uint32_t>>,
+                       greater<pair<double, uint32_t>>>
+            pq;
+        pq.push({0.0, src});
+        while (!pq.empty())
+        {
+            auto [d, u] = pq.top();
+            pq.pop();
+            if (d > dist[u])
+            {
+                continue;
+            }
+            for (uint32_t v : mAdj[u])
+            {
+                double w = GetLink(u, v).baseDelayMs;
+                if (dist[u] + w < dist[v])
+                {
+                    dist[v] = dist[u] + w;
+                    hops[v] = hops[u] + 1;
+                    pq.push({dist[v], v});
+                }
+            }
+        }
+        for (uint32_t dst = 0; dst < mNum; ++dst)
+        {
+            if (dst == src)
+            {
+                continue;
+            }
+            if (isinf(dist[dst]))
+            {
+                allReachable = false; // a partitioned mesh has no meaningful mean
+                continue;
+            }
+            delaySum += dist[dst];
+            hopSum += hops[dst];
+            ++pairs;
+        }
+    }
+    if (pairs == 0)
+    {
+        return out;
+    }
+    out.delayMs = delaySum / pairs;
+    out.hops = hopSum / pairs;
+    out.connected = allReachable;
+    return out;
 }
 
 bool

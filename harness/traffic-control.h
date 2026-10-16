@@ -94,8 +94,41 @@ ns3::QueueDiscContainer InstallSliceQdiscs(const ns3::NetDeviceContainer& device
  * bucket is a ceiling, not a floor; the floor is manufactured by that sum. Oversubscribe
  * and the strict-priority root starves the lowest band, which is plain QoS again.
  */
+/**
+ * Set every slice band's AQM sojourn target, on every node.
+ *
+ * Why this is not left at Cobalt's 5 ms default. Both arms of the comparison use the SAME target,
+ * but they apply it to different things: ns-3's FqCoDel hashes into 1024 flow queues, so the
+ * no-slicing baseline measures sojourn PER FLOW, while a slice band is ONE queue carrying all of
+ * that slice's flows. Twelve multiplexed flows build roughly twelve times the backlog, so the
+ * aggregate queue crosses 5 ms far sooner and Cobalt drops traffic the baseline never touches --
+ * measured at 9 Mb/s per slice as 26-37% loss across all three slices against the baseline's
+ * 0.00%, including eMBB, whose rate limit (44.78 Mb/s against 1.99 offered) cannot possibly bind.
+ *
+ * So the target is scaled by the number of flows multiplexed into the band: `5 ms x flows`, where
+ * 5 ms is Nichols & Jacobson's published CoDel value and the flow count is COUNTED from
+ * `Slice::Pairs`. That keeps per-flow treatment equivalent to the baseline's and follows the grid
+ * when member counts change, so it is a derivation rather than a tuned constant.
+ */
+/**
+ * CoDel's published sojourn target, Nichols & Jacobson -- also ns-3's own default for CoDel,
+ * FqCoDel and Cobalt. CITED, not chosen. It is the per-FLOW figure, which is why a slice band
+ * carrying several flows scales it; see SetSliceLatencyTargets.
+ */
+constexpr double CODEL_TARGET_SEC = 0.005;
+
+/**
+ * Pick the Tbf's child discipline before InstallSliceQdiscs runs. Only peek-safe discs are
+ * legal here -- Fifo, Cobalt, Red, PfifoFast, Prio, Mq -- because TbfQueueDisc reads the head
+ * packet's size through Peek(); FqCoDel and CoDel peek by DEQUEUING and spin at 100% CPU.
+ * See the comment block in InstallSliceQdiscs.
+ */
+void SetSliceAqm(const std::string& typeId);
+
+void SetSliceLatencyTargets(const ns3::QueueDiscContainer& qdiscs, double targetSec);
+
 void SetSliceRates(const ns3::QueueDiscContainer& qdiscs,
-                   const std::array<double, nsga::NUM_SLICES>& shareMbps);
+                   const std::array<double, nsga::NUM_SLICES>& limitMbps);
 
 /**
  * Same, for ONE radio. The per-node controller needs this: capacity is a property of the
@@ -103,7 +136,7 @@ void SetSliceRates(const ns3::QueueDiscContainer& qdiscs,
  */
 void SetSliceRatesOn(const ns3::QueueDiscContainer& qdiscs,
                      std::uint32_t index,
-                     const std::array<double, nsga::NUM_SLICES>& shareMbps);
+                     const std::array<double, nsga::NUM_SLICES>& limitMbps);
 
 /**
  * Bytes offered to each slice's bucket on one radio, counted BEFORE any policing. This is
@@ -112,6 +145,16 @@ void SetSliceRatesOn(const ns3::QueueDiscContainer& qdiscs,
  * cap chase its own tail to zero (the same failure as capacity-feedback-gate's sensor (a)).
  */
 std::array<std::uint64_t, nsga::NUM_SLICES> SliceOfferedBytes(
+    const ns3::QueueDiscContainer& qdiscs,
+    std::uint32_t index);
+
+/**
+ * Bytes each slice band is holding RIGHT NOW, as an instantaneous level rather than a counter.
+ * The controller takes the larger of this and the tick's arrivals, because a limit sized from
+ * arrivals alone can be below what the bucket already holds, and then the backlog can never
+ * clear: measured at load 27, one URLLC node was offered 28.78x its own limit.
+ */
+std::array<std::uint64_t, nsga::NUM_SLICES> SliceBacklogBytes(
     const ns3::QueueDiscContainer& qdiscs,
     std::uint32_t index);
 
@@ -132,8 +175,12 @@ void PrintSliceQdiscStats(const ns3::QueueDiscContainer& qdiscs,
  */
 void PrintCapVsOffered(const ns3::QueueDiscContainer& qdiscs, double spanSec);
 
-/** URLLC bucket depth, in packets. Default 24: the minimum that meets the cited PLR <= 1e-5 at
- *  the headroom's own rho* = 0.61 over ~3.4 hops. Must be called BEFORE InstallSliceQdiscs. */
-void SetUrllcQueuePackets(std::uint32_t packets);
+/**
+ * Set the minimum cap a bucket may be given, derived as one MTU per control period: below that a
+ * bucket cannot pass a full-size packet before the controller retunes it, so its backlog is
+ * effectively frozen. Call it when the controller's period is known; the default derives from
+ * 0.5 s. See the comment on `g_minLimitMbps` in traffic-control.cc.
+ */
+void SetMinLimitFromPeriod(double periodSec);
 
 #endif // TRAFFIC_CONTROL_H

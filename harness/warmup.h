@@ -71,7 +71,6 @@ struct WarmupSession
     ns3::Ptr<ns3::Ipv4FlowClassifier> classifier;
     ns3::Ptr<ns3::FlowMonitor> monitor;
     double windowSec = 0.5;
-    double primeSec = 0.1; // unmeasured pre-roll per edge: resolves ARP + lets the queue settle. <=0 disables it
     int maxRounds = 3;
     // Drain time between windows. Must exceed the R window's BACKLOG drain, not just the window:
     // a 0.5 s burst above the link rate keeps arriving long after the sender stops, and if that
@@ -111,7 +110,6 @@ struct WarmupSession
     // of RFC 2544, with the stopping test "measured rate stops following the offered rate" --
     // loss alone does not work, since an 85 Mb/s probe reads the link correctly at 0% loss.
     std::string satRate = "120Mb/s";
-    std::string primeRate = "1Mb/s";  // prime rate: low so it resolves ARP without flooding the queue before the delay window
     uint32_t pktSize = 700;           // probe payload; must match the slice traffic or R is measured at the wrong efficiency
     // Filled as the sweep runs:
     // Reset the sender between links instead of hoping its leftovers are gone. Measured on
@@ -119,6 +117,18 @@ struct WarmupSession
     // on, 40 of 40 in one round with none patched. Edge ordering was tried first and did
     // nothing (23 vs 24), so there is no ordering rule here.
     bool flushSender = true;
+    // 0 = sweep every edge. Above 0, measure only this many, spread across grid POSITIONS --
+    // corner, edge, interior. The sweep is serial and edge count grows as 2*w*(w-1), so 32x32 is
+    // 1984 edges against 10x10's 180, and a full sweep there is the open problem in
+    // fail/WarmupBatching.md.
+    //
+    // A sample is only legitimate because a link's isolated capacity does not depend on grid size:
+    // spacing, transmit power, propagation and MCS set it, and each edge is probed alone with the
+    // sender flushed. 900 measurements across five 10x10 seeds agree to 0.2%. So the sample is a
+    // TRANSFER CHECK on a known constant, not an estimate of an unknown one -- and the positions
+    // are spread precisely so it can DETECT a position effect rather than assume none.
+    // results/codes/filltable.py refuses to build a table if the check fails.
+    uint32_t sampleEdges = 0;
     // How often the sweep asks whether the last sender's queues are empty. It changes when the
     // next edge is noticed to be clear, never any measured value, so it is not a tuning knob.
     double drainPollSec = 0.01;
@@ -147,6 +157,11 @@ struct WarmupSession
  * orthogonal neighbours and dropping diagonals.
  */
 std::vector<Edge> BuildEdgeListGeometric(const MeshTopology& mesh, double maxDist = 0.0);
+
+/** Pick `want` edges spread by distance from the field centre; see WarmupSession::sampleEdges. */
+std::vector<Edge> SampleEdgesByPosition(const MeshTopology& mesh,
+                                        const std::vector<Edge>& all,
+                                        uint32_t want);
 
 /**
  * Round 1 of the warm-up. Call at sim time `startSec` (via Simulator::Schedule).

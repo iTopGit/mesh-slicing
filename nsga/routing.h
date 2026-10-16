@@ -5,6 +5,8 @@
 #include "graph.h"
 #include "individual.h"
 
+#include "slice.h"
+
 #include <array>
 #include <cstdint>
 #include <vector>

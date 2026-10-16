@@ -34,11 +34,16 @@ namespace nsga {
 static bool
 Dominates(const Individual& a, const Individual& b)
 {
-    if (a.stranded != b.stranded)
+    // Deb's constraint domination over BOTH violations: a member with no path, and a link asked
+    // to carry more than its neighbourhood allows. Summed because neither is tolerable and the
+    // objectives are not comparable while either is non-zero.
+    int av = a.stranded + a.saturated;
+    int bv = b.stranded + b.saturated;
+    if (av != bv)
     {
-        return a.stranded < b.stranded;
+        return av < bv;
     }
-    if (a.stranded > 0)
+    if (av > 0)
     {
         return false; // equally infeasible: neither dominates, objectives are meaningless here
     }
@@ -254,7 +259,7 @@ MakeChild(const Individual& p1,
         c.seg[s] = OrderCrossover(p1.seg[s], p2.seg[s], rng); // per-segment, disjoint members
         SwapMutation(c.seg[s], params.mutationRate, rng);
     }
-    Evaluate(c, g, slices, params.C);
+    Evaluate(c, g, slices, params.t0Ms);
     return c;
 }
 
@@ -326,7 +331,7 @@ Run(const Graph& g,
             ind.seg[s] = slices[s].members;
             shuffle(ind.seg[s].begin(), ind.seg[s].end(), rng);
         }
-        Evaluate(ind, g, slices, p.C);
+        Evaluate(ind, g, slices, p.t0Ms);
     }
     auto fronts = FastNonDominatedSort(pop);
     for (const auto& f : fronts)

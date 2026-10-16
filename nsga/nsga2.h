@@ -16,7 +16,14 @@ struct Params
     uint32_t popSize = 100;
     uint32_t generations = 100;
     double mutationRate = 0.1; // per-segment swap-mutation probability
-    double C = 4.53;           // calibrated delay constant (PLAN.md §10)
+    // T0: the per-hop delay the model divides by (1-U). Named T0 everywhere -- docs, CLI and
+    // code -- because it used to be `gaC` here, `C` in fitness and `T0` in the design notes, and
+    // three names for one number is how the 4.53-against-3.9 conflict survived unnoticed.
+    // It is a FIT over mid utilization, not a measured zero-load delay: warm-up measures the
+    // idle per-hop cost as 0.128 ms (linktable base_delay_ms), 9x smaller. See PLAN.md step 2.
+    // 1.1796 is the 10x10 fit; it replaced the 5x5 fit 0.989 on 2026-10-13. Provenance and the
+    // three things it is not are recorded on t0Ms in harness/main.cc.
+    double t0Ms = 1.1796;
     bool trace = false;        // print per-generation best-objective progress
     int showGen = -1;          // dump one individual at this generation (-1 = never)
 };

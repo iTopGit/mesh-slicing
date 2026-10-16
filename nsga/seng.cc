@@ -65,7 +65,7 @@ SengRun(const Graph& g, const array<Slice, NUM_SLICES>& slices, const Params& p,
             pop[i].seg[s] = slices[s].members;
             shuffle(pop[i].seg[s].begin(), pop[i].seg[s].end(), rng);
         }
-        Evaluate(pop[i], g, slices, p.C);
+        Evaluate(pop[i], g, slices, p.t0Ms);
         cost[i] = SengCost(pop[i], g, slices);
     }
     auto tournament = [&]() {
@@ -99,7 +99,7 @@ SengRun(const Graph& g, const array<Slice, NUM_SLICES>& slices, const Params& p,
                 c.seg[s] = OrderCrossover(a.seg[s], b.seg[s], rng);
                 SwapMutation(c.seg[s], p.mutationRate, rng);
             }
-            Evaluate(c, g, slices, p.C);
+            Evaluate(c, g, slices, p.t0Ms);
             next[i] = c;
             nextCost[i] = SengCost(c, g, slices);
         }

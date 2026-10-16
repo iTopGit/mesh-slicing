@@ -16,6 +16,7 @@ using namespace std;
 namespace nsga {
 
 bool g_obj1Max = false;
+bool g_obj0Alloc = false;
 
 vector<double>
 FairShare(double R, const vector<double>& demand)
@@ -206,10 +207,20 @@ void
 Evaluate(Individual& ind,
          const Graph& g,
          const array<Slice, NUM_SLICES>& slices,
-         double C)
+         double t0Ms)
 {
-    const double BIG = 1e6; // U>=1 -> link saturated: a flat huge delay penalty
+    // A saturated link is COUNTED (ind.saturated), not priced with a sentinel. The delay still
+    // needs a finite value for the path sum, so U is clamped just below 1: that keeps effDelay
+    // large but strictly proportional to t0Ms, which is what makes obj[1] scale-invariant and so
+    // makes T0 unable to change route choice. A 1e6 sentinel did not scale and did change it.
+    const double U_CLAMP = 0.99;
     const uint32_t NONE = g.NumNodes();
+
+    // Both constraint counters are reset here, before anything can increment them: Evaluate is
+    // called again on individuals that survive a generation, so a counter that only ever adds
+    // would climb across generations and make an old solution look worse than a new one.
+    ind.stranded = 0;
+    ind.saturated = 0;
 
     // Step 1: decode all 3 member-orders into trees (each = a set of mesh links).
     array<Tree, NUM_SLICES> trees;
@@ -226,6 +237,7 @@ Evaluate(Individual& ind,
     {
         array<double, NUM_SLICES> alloc = {0, 0, 0}; // fair-share throughput per slice
         double effDelay = 0.0;                       // queueing delay on this link
+        double spare = 0.0;                          // R(1-U): what the link could still carry
     };
     map<EdgeKey, LinkLoad> load;
     LinkAirtime air = SpreadDemand(g, trees, slices);
@@ -255,13 +267,17 @@ Evaluate(Individual& ind,
         {
             ll.alloc[idx[i]] = a[i];
         }
-        ll.effDelay = (U < 1.0) ? C / (1.0 - U) : BIG;
+        if (U >= 1.0)
+        {
+            ++ind.saturated;
+        }
+        ll.effDelay = t0Ms / (1.0 - min(U, U_CLAMP));
+        ll.spare = R * (1.0 - min(U, U_CLAMP));
         load[e] = ll;
     }
 
     // Step 3a: the feasibility constraint. A member whose parent pointer is NONE never reached
     // its root, so its traffic goes nowhere. The root itself legitimately has no parent.
-    ind.stranded = 0;
     for (int s = 0; s < NUM_SLICES; ++s)
     {
         for (uint32_t m : slices[s].members)
@@ -274,16 +290,31 @@ Evaluate(Individual& ind,
     }
 
     // Step 3b: reduce each slice's tree to its one objective number.
-    // obj[0] eMBB: bottleneck (min) fair-share throughput across its links.
+    //
+    // obj[0] eMBB: SPARE CAPACITY at the bottleneck link, R(1-U), maximised.
+    //
+    // It used to be the fair-share allocation itself, and that was degenerate wherever it mattered.
+    // FairShare is the IDENTITY below saturation - a slice whose demand fits its share gets its
+    // full ask - so `alloc[0]` was just eMBB's neighbourhood demand handed back. Three consequences,
+    // all measured 2026-10-12 on the 5x5: the value only ever took integer multiples of the
+    // per-pair demand (2.000 / 4.000 / 5.000), it sat at its maximum in the RANDOM initial
+    // population and never moved in 100 generations, and its sign was inverted - maximising it
+    // rewarded putting MORE eMBB load around eMBB's own links.
+    //
+    // R(1-U) fixes all three. It moves with every route change, because moving a path changes which
+    // links share a neighbourhood; more load means less spare, so the sign is right; and it stays
+    // in Mb/s, so it is still eMBB's throughput concern - the headroom before its worst link fills,
+    // which is what "bottleneck" always meant. At U -> 1 it goes to zero, and `saturated` counts
+    // that case separately.
     double embbMin = numeric_limits<double>::infinity();
     for (const vector<EdgeKey>& path : air.pairPaths[0])
     {
         for (const EdgeKey& e : path)
         {
-            embbMin = min(embbMin, load[e].alloc[0]);
+            embbMin = min(embbMin, g_obj0Alloc ? load[e].alloc[0] : load[e].spare);
         }
     }
-    ind.obj[0] = isinf(embbMin) ? 0.0 : embbMin; // no eMBB links -> zero throughput
+    ind.obj[0] = isinf(embbMin) ? 0.0 : embbMin; // no eMBB links -> worst possible
 
     // obj[1] URLLC: MEAN over pairs of each pair's summed path delay.
     //
@@ -301,6 +332,14 @@ Evaluate(Individual& ind,
     size_t urllcPairs = 0;
     for (const vector<EdgeKey>& path : air.pairPaths[1])
     {
+        // A pair with no path would contribute d = 0 and pull the mean DOWN, which is the
+        // disconnected-tree reward this objective used to carry. `stranded` already ranks such an
+        // individual last, so nothing can reach the mean through here -- skipping it removes the
+        // property itself rather than relying on the constraint to mask it.
+        if (path.empty())
+        {
+            continue;
+        }
         double d = 0.0;
         for (const EdgeKey& e : path)
         {
@@ -316,6 +355,10 @@ Evaluate(Individual& ind,
 
     // obj[2] mMTC: tree link count (scale/cost — mMTC is low-rate + delay-insensitive,
     // its concern is connecting many nodes cheaply; see PLAN.md §3).
+    //
+    // An empty tree reads 0 links, the best possible value, and that CANNOT be guarded the way
+    // obj[1] is: 0 is the honest count, and penalising it would change what this objective means.
+    // What protects it is `stranded` plus constraint domination, so do not "fix" it here.
     ind.obj[2] = static_cast<double>(trees[2].links.size());
 }
 
